@@ -18,6 +18,7 @@ import { VIRTUAL_DOUBLE_ELEMENT_KINDS } from "./virtual-double-category-schema.j
 import { bindThetaVolumePanel } from "./theta-volume-panel.js";
 import { appendPdfPreview, safePayloadPreviewUrl } from "./payload-preview.js";
 import { STATIC_LATEX_COMPILE_MESSAGE } from "./runtime-config.js";
+import { shapeExpansionEligibility } from "./shape-expansion.js";
 
 const PANEL_COLLAPSE_STORAGE_KEY = "jsgolog.ui.collapsedPanels.v1";
 const LATEX_COMPILE_ENDPOINT = "/__golog/latex/compile";
@@ -118,6 +119,93 @@ function openablePayloadUrl(value) {
   }
 }
 
+export function renderShapeExpansionControls({ state, objectId, buttons }) {
+  const eligibility = shapeExpansionEligibility(state, objectId);
+  for (const button of buttons) {
+    if (!button) continue;
+    button.disabled = !eligibility.allowed;
+    button.title = eligibility.reason;
+  }
+  return eligibility;
+}
+
+export function readImageFileForObject({
+  workspace, state, objectId, file,
+  createReader = () => new FileReader(), onReady = () => {},
+}) {
+  const golog = workspace.gologs.get(state?.gologId);
+  if (!file || golog?.state !== state || !state?.hasSelectableSimplex(objectId)) {
+    return null;
+  }
+  const ownerBus = golog.bus;
+  const existing = state.getPayloadByKind(objectId, "image");
+  const payload = {
+    type: imagePayloadType(file.type || "image/png"),
+    mimeType: file.type || "image/png",
+    alt: existing?.alt ?? "",
+    name: file.name,
+  };
+  const reader = createReader();
+  let ownerDeleted = false;
+  const releaseOwner = ownerBus.on("store:object-deleted", ({ id }) => {
+    if (id === objectId) ownerDeleted = true;
+  });
+  const finish = () => {
+    releaseOwner();
+    reader.removeEventListener("load", loaded);
+    reader.removeEventListener("error", finish);
+    reader.removeEventListener("abort", finish);
+  };
+  const loaded = () => {
+    finish();
+    // A file belongs to the owner chosen before reading, never a later selection
+    // or a replacement workspace that happens to reuse the same identifiers.
+    if (ownerDeleted || workspace.gologs.get(golog.id) !== golog ||
+      golog.state !== state || golog.bus !== ownerBus ||
+      !state.hasSelectableSimplex(objectId)) return;
+    onReady();
+    ownerBus.emit(existing ? "payload:typed-update" : "payload:typed-add", {
+      id: objectId,
+      payload: { ...payload, src: String(reader.result ?? "") },
+    });
+  };
+  reader.addEventListener("load", loaded);
+  reader.addEventListener("error", finish);
+  reader.addEventListener("abort", finish);
+  try {
+    reader.readAsDataURL(file);
+  } catch (error) {
+    finish();
+    throw error;
+  }
+  return reader;
+}
+
+export function renderObjectDeletionResult({
+  result,
+  warningElement,
+  confirmButton,
+  confirmation = false,
+}) {
+  const blocked = result?.blocked || result?.ok === false;
+  const completed = !blocked && confirmation && result?.deleted === true && result?.dryRun === false;
+  const confirmable = !blocked && !confirmation;
+  let message;
+  if (blocked) {
+    message = `Delete blocked: ${(result.blockedReasons ?? []).join("; ") || "This object cannot currently be deleted."}`;
+  } else if (confirmation && !completed) {
+    message = "Delete was not completed. Review the object and request a new preview.";
+  } else if (completed) {
+    const count = result.deletedObjectIds?.length ?? result.objectSummary?.total ?? 1;
+    message = `Deleted ${count} object${count === 1 ? "" : "s"}.`;
+  } else {
+    message = `${result.warning} Press Confirm Delete.`;
+  }
+  if (warningElement) warningElement.textContent = message;
+  if (confirmButton) confirmButton.hidden = !confirmable;
+  return { confirmable, completed };
+}
+
 export function bindStatusPanel({
   workspace,
   operationOrigin,
@@ -158,6 +246,7 @@ export function bindStatusPanel({
   const virtualArrowButtons = [
     ...documentRef.querySelectorAll("[data-virtual-arrow-kind]"),
   ];
+  const virtualCellCancel = documentRef.querySelector("#virtual-cell-cancel");
   const virtualCellCapture = documentRef.querySelector("#virtual-cell-capture");
   const toggleUiPanelsButton = documentRef.querySelector("#toggle-ui-panels");
   const iphoneDragModeToggle = documentRef.querySelector(
@@ -440,6 +529,11 @@ export function bindStatusPanel({
       return;
     }
     const appRect = appRoot.getBoundingClientRect();
+    const toolbarRect = gologTabbar?.getBoundingClientRect();
+    if (toolbarRect) {
+      appRoot.style.setProperty("--golog-toolbar-bottom",
+        `${Math.max(0, Math.ceil(toolbarRect.bottom - appRect.top))}px`);
+    }
     const anchor =
       shortcutHints && !shortcutHints.hidden ? shortcutHints : gologTabbar;
     const anchorRect = anchor?.getBoundingClientRect?.();
@@ -643,6 +737,10 @@ export function bindStatusPanel({
       payloadAssociateGolog,
       !canAdd || keys.has("nested-golog"),
     );
+    renderShapeExpansionControls({
+      state, objectId: selected?.id,
+      buttons: [payloadAddGolog, payloadAssociateGolog],
+    });
     const visibleButton = [
       payloadAddText,
       payloadAddLatex,
@@ -1399,7 +1497,8 @@ export function bindStatusPanel({
       setDeleteWarning("Delete is disabled in this mode.");
       return;
     }
-    if (pendingDeletePlan?.objectId !== selected.id) {
+    if (pendingDeletePlan?.objectId !== selected.id ||
+      pendingDeletePlan?.gologId !== state.gologId) {
       resetDeletePanel();
     }
   }
@@ -1543,9 +1642,14 @@ export function bindStatusPanel({
           : `Cell ${count}`
         : "Cell";
       virtualCellCapture.title = virtualCellCaptureState.active
-        ? "Click boundary arrows, then create the cell"
+        ? "Click boundary arrows, then create the cell. Escape cancels."
         : "Select a virtual-cell boundary";
     }
+    if (virtualCellCancel) {
+      virtualCellCancel.hidden = !active || !virtualCellCaptureState.active;
+      virtualCellCancel.disabled = !active || !virtualCellCaptureState.active;
+    }
+    scheduleRightUiStackUpdate();
   }
 
   function clearActiveListeners() {
@@ -2192,6 +2296,7 @@ export function bindStatusPanel({
       gologTabs.appendChild(tab);
     }
     renderIphoneTabSwitcher();
+    scheduleRightUiStackUpdate();
   }
 
   function clearTabDrag() {
@@ -2340,7 +2445,7 @@ export function bindStatusPanel({
     if (
       !selectedSimplexId ||
       !state ||
-      !state.hasSelectableSimplex(selectedSimplexId) ||
+      !shapeExpansionEligibility(state, selectedSimplexId).allowed ||
       !modeHead.canAttachPayload(state.gologId)
     ) {
       return;
@@ -2364,7 +2469,10 @@ export function bindStatusPanel({
       expansionStatus.hidden = false;
       expansionStatus.style.display = "block";
     } finally {
-      payloadAddGolog.disabled = false;
+      renderShapeExpansionControls({
+        state, objectId: selectedSimplexId,
+        buttons: [payloadAddGolog, payloadAssociateGolog],
+      });
     }
   });
 
@@ -2372,7 +2480,7 @@ export function bindStatusPanel({
     if (
       !selectedSimplexId ||
       !state ||
-      !state.hasSelectableSimplex(selectedSimplexId) ||
+      !shapeExpansionEligibility(state, selectedSimplexId).allowed ||
       !modeHead.canAttachPayload(state.gologId)
     ) {
       return;
@@ -2400,10 +2508,11 @@ export function bindStatusPanel({
         objectId: selectedSimplexId,
         cascade: "recursive",
       });
-      setDeleteWarning(`${pendingDeletePlan.warning} Press Confirm Delete.`);
-      if (deleteObjectConfirm) {
-        deleteObjectConfirm.hidden = false;
-      }
+      renderObjectDeletionResult({
+        result: pendingDeletePlan,
+        warningElement: deleteObjectWarning,
+        confirmButton: deleteObjectConfirm,
+      });
     } catch (error) {
       pendingDeletePlan = null;
       setDeleteWarning(`Delete preview failed: ${error.message}`);
@@ -2416,26 +2525,35 @@ export function bindStatusPanel({
   deleteObjectConfirm?.addEventListener("click", () => {
     if (
       !pendingDeletePlan ||
+      pendingDeletePlan.blocked ||
+      pendingDeletePlan.ok === false ||
       !state ||
       !agentApi ||
       !modeHead.canDeleteObject?.(state.gologId)
     ) {
       return;
     }
-    const { objectId, warning } = pendingDeletePlan;
+    const { objectId, gologId } = pendingDeletePlan;
+    if (gologId !== state.gologId || objectId !== selectedSimplexId) {
+      resetDeletePanel();
+      setDeleteWarning("Selection changed. Request a new delete preview.");
+      return;
+    }
     try {
       const result = agentApi.deleteObject({
-        gologId: state.gologId,
+        gologId,
         objectId,
         cascade: "recursive",
         dryRun: false,
         confirmed: true,
       });
-      pendingDeletePlan = null;
-      setDeleteWarning(result.warning ?? warning ?? "Deleted.");
-      if (deleteObjectConfirm) {
-        deleteObjectConfirm.hidden = true;
-      }
+      pendingDeletePlan = result.blocked || result.ok === false ? result : null;
+      renderObjectDeletionResult({
+        result,
+        warningElement: deleteObjectWarning,
+        confirmButton: deleteObjectConfirm,
+        confirmation: true,
+      });
     } catch (error) {
       setDeleteWarning(`Delete failed: ${error.message}`);
     }
@@ -2592,26 +2710,19 @@ export function bindStatusPanel({
 
   payloadImageInput.addEventListener("change", () => {
     const file = payloadImageInput.files?.[0];
-    if (!file || !selectedSimplexId || !bus || !state) {
+    if (!file || !selectedSimplexId || !state || !modeHead.canEditPayload(state.gologId)) {
       return;
     }
-    const existing = state.getPayloadByKind?.(selectedSimplexId, "image") ?? null;
-    const reader = new FileReader();
-    reader.addEventListener("load", () => {
-      selectedPayloadKey = "image";
-      const payload = {
-        type: imagePayloadType(file.type || "image/png"),
-        mimeType: file.type || "image/png",
-        src: String(reader.result ?? ""),
-        alt: existing?.alt ?? "",
-        name: file.name,
-      };
-      bus.emit(existing ? "payload:typed-update" : "payload:typed-add", {
-        id: selectedSimplexId,
-        payload,
-      });
+    const ownerState = state;
+    const objectId = selectedSimplexId;
+    readImageFileForObject({
+      workspace, state: ownerState, objectId, file,
+      onReady: () => {
+        if (state === ownerState && selectedSimplexId === objectId) {
+          selectedPayloadKey = "image";
+        }
+      },
     });
-    reader.readAsDataURL(file);
   });
 
   function emitUrlPayload() {
@@ -2833,6 +2944,10 @@ export function bindStatusPanel({
 
   virtualCellCapture?.addEventListener("click", () => {
     bus?.emit("virtual-cell:capture-toggle", {});
+  });
+
+  virtualCellCancel?.addEventListener("click", () => {
+    bus?.emit("virtual-cell:cancel", {});
   });
 
   openMetaGologButton.addEventListener("click", () => {

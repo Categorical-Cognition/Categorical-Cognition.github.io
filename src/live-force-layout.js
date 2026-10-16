@@ -1,10 +1,11 @@
 import { partitionForceLayoutGraph } from "./distributed-force-layout.js";
 import {
+  CONVERGENCE_OBSERVATION_SOURCES,
   SEMANTIC_CONVERGENCE_CHANGED_EVENT,
 } from "./semantic-convergence-service.js";
 import { LOCAL_SHEAF_GLUE_CHANGED_EVENT } from "./local-sheaf-glue-service.js";
 import { peerHolderId } from "./peer-context.js";
-import { RESOURCE_CLAIMS_CHANGED_EVENT } from "./resource-claim-manager.js";
+import { normalizeClaimant, RESOURCE_CLAIMS_CHANGED_EVENT } from "./resource-claim-manager.js";
 
 export const LIVE_FORCE_LAYOUT_DEFAULTS = Object.freeze({
   enabled: true,
@@ -37,14 +38,14 @@ const FORCE_SETTING_RANGES = Object.freeze({
 });
 export const LIVE_FORCE_LAYOUT_SETTING_KEYS = Object.freeze(Object.keys(FORCE_SETTING_RANGES));
 
-const POSITION_EPSILON_SQ = 1e-8;
+const POSITION_EPSILON_SQ = 1e-12;
 const FORCE_COMMIT_DEADBAND_SQ = 0.015 * 0.015;
 const FORCE_COMMIT_CLAIM_TTL_MS = 30_000;
 const FORCE_COMMIT_CLAIM_RETRY_MS = 2_000;
 const FORCE_COMMIT_MIN_INTERVAL_MS = 120;
 const FORCE_SOLVER_ACTIVITY_WINDOW_MS = 8_000;
-const FORCE_QUIESCENCE_FORCE_SQ = 0.002 * 0.002;
-const FORCE_QUIESCENCE_MOVEMENT_SQ = 0.003 * 0.003;
+const FORCE_QUIESCENCE_FORCE_SQ = 0.00001 * 0.00001;
+const FORCE_QUIESCENCE_MOVEMENT_SQ = 0.00001 * 0.00001;
 const FORCE_QUIESCENCE_TICKS = 3;
 export const LIVE_FORCE_LAYOUT_SETTINGS_CHANGED_EVENT =
   "live-force-layout:settings-changed";
@@ -259,10 +260,19 @@ function maxForceMagnitudeSq(result) {
   );
 }
 
+function sharedConvergenceIntents(store, strength) {
+  // A local edit or layout publication is not an external position constraint.
+  // Otherwise the browser's own drag history becomes a permanent spring.
+  return (store.semanticConvergence?.intents?.({ strength }) ?? []).filter(
+    (intent) => intent.observationSources?.[CONVERGENCE_OBSERVATION_SOURCES.GLOBAL_COMMIT] > 0,
+  );
+}
+
 // Main and nested views share one numerical policy. Scheduling and publication
 // are adapters around the same force controller, not separate physical laws.
 function forceOptionsFor(store, settings) {
   const vertexCount = store.spheres.size;
+  const dt = vertexCount > 160 ? 0.36 : 0.48;
   return {
     graphOptions: { edgeStrength: settings.edgePull, defaultRestLength: settings.restLength },
     fieldOptions: {
@@ -277,9 +287,12 @@ function forceOptionsFor(store, settings) {
       twoSimplexFaceTighteningFactor: settings.twoSimplexFaceTightening,
     },
     solverOptions: {
-      dt: vertexCount > 160 ? 0.36 : 0.48,
+      dt,
       damping: 0.84,
       maxVelocity: vertexCount > 160 ? 0.32 : 0.58,
+      forceDeadband: Math.sqrt(FORCE_QUIESCENCE_FORCE_SQ),
+      // Any force above its deadband must be able to initiate motion at rest.
+      velocityDeadband: dt * Math.sqrt(FORCE_QUIESCENCE_FORCE_SQ),
     },
   };
 }
@@ -592,14 +605,12 @@ export class LiveForceLayoutService {
     const humanControlledIds = humanControlledSphereIds(store);
     const result = this.quiescent && this.lastResult ? this.lastResult : controller.step({
       positionEvents: positionEventsForStore(store, humanControlledIds),
-      externalIntents: store.semanticConvergence?.intents?.({
-        strength: this.settings.globalCoherence,
-      }),
+      externalIntents: sharedConvergenceIntents(store, this.settings.globalCoherence),
     });
     this.lastResult = result;
     const previewResult = withoutHumanClaimedPositions(result, humanControlledIds);
     const commitResult = this.restrictToOwnedShard(previewResult, controller, options);
-    const movedVisibly = resultMovedSnapshot(
+    const movedBeyondRestTolerance = resultMovedSnapshot(
       previewResult,
       preStepPositions,
       FORCE_QUIESCENCE_MOVEMENT_SQ,
@@ -607,7 +618,7 @@ export class LiveForceLayoutService {
     this.lastMaxForceMagnitudeSq = maxForceMagnitudeSq(result);
     if (
       this.lastMaxForceMagnitudeSq <= FORCE_QUIESCENCE_FORCE_SQ &&
-      !movedVisibly
+      !movedBeyondRestTolerance
     ) {
       this.quietStepCount += 1;
     } else {
@@ -624,7 +635,9 @@ export class LiveForceLayoutService {
       (publishResult.positions?.length ?? 0) + (publishResult.edgeControls?.length ?? 0) > 0;
     const shouldCommit = this.pendingPublication &&
       now - this.lastCommitSubmittedAt >= FORCE_COMMIT_MIN_INTERVAL_MS;
-    if (movedVisibly) {
+    // Retain small steps: the next tick reads these coordinates as its input.
+    // A visual threshold here would discard slow motion before it accumulates.
+    if (resultMovedSnapshot(previewResult, preStepPositions)) {
       this.applyingForcePreview = true;
       store.applyLayoutPreviewPositions?.(
         previewResult.positions,
@@ -671,10 +684,15 @@ export class LiveForceLayoutService {
     if (now - this.lastClaimAttemptAt < FORCE_COMMIT_CLAIM_RETRY_MS) {
       return null;
     }
-    // The exact policy has already ruled out conflicting holders. Acquire the
-    // entire proposed layout's write set, not one missing node per retry cycle.
-    const missing = decision.manifest?.writeResources ??
-      decision.authority?.diagnostics?.missingClaimGroup ?? [];
+    // The write manifest includes the enclosing golog for conflict checks, but
+    // layout only needs the missing coordinate claims, never a golog-wide lease.
+    const claimant = normalizeClaimant(operation.origin);
+    const groups = decision.manifest?.requiredClaimGroups ??
+      decision.requiredClaimGroups ?? [decision.authority?.diagnostics?.missingClaimGroup ?? []];
+    const missing = [...new Set(groups
+      .filter((group) => !group.some((id) => store.resourceClaims.claimIsHeldBy(id, claimant)))
+      .map((group) => group[0])
+      .filter(Boolean))];
     if (missing.length === 0) {
       return null;
     }
@@ -902,20 +920,18 @@ export class PreviewForceUniverse {
     const result = entry.controller.step({
       positionEvents: positionEventsForStore(store, humanControlledIds),
       externalIntents: [
-        store.semanticConvergence?.intents?.({
-          strength: this.settings().globalCoherence,
-        }),
+        sharedConvergenceIntents(store, this.settings().globalCoherence),
         externalIntents,
       ],
     });
     const previewResult = withoutHumanClaimedPositions(result, humanControlledIds);
-    const movedVisibly = resultMovedSnapshot(
+    const movedBeyondRestTolerance = resultMovedSnapshot(
       previewResult,
       preStepPositions,
       FORCE_QUIESCENCE_MOVEMENT_SQ,
     );
     const maxForceMagnitude = maxForceMagnitudeSq(result);
-    if (movedVisibly) {
+    if (resultMovedSnapshot(previewResult, preStepPositions)) {
       entry.applyingPreview = true;
       store.applyLayoutPreviewPositions?.(
         previewResult.positions,
@@ -925,7 +941,7 @@ export class PreviewForceUniverse {
         entry.applyingPreview = false;
       });
     }
-    if (maxForceMagnitude <= FORCE_QUIESCENCE_FORCE_SQ && !movedVisibly) {
+    if (maxForceMagnitude <= FORCE_QUIESCENCE_FORCE_SQ && !movedBeyondRestTolerance) {
       entry.quietStepCount += 1;
     } else {
       entry.quietStepCount = 0;

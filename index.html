@@ -106,6 +106,7 @@
             <button id="virtual-cell-capture" type="button" aria-pressed="false">
               Cell
             </button>
+            <button id="virtual-cell-cancel" type="button" hidden>Cancel Cell</button>
           </div>
           <select id="new-golog-structure" aria-label="New golog structure">
             <option value="hierarchical-theta-space">Theta</option>
@@ -395,7 +396,7 @@
         accept=".json,.golog,.golog.json,application/json"
         hidden
       />
-      <div id="workspace-io-status" class="screen-reader-status" aria-live="polite"></div>
+      <div id="workspace-io-status" role="status" aria-live="polite"></div>
     </main>
     <script type="importmap">{
   "imports": {

@@ -141,6 +141,7 @@ body {
   left: auto;
   max-width: min(78vw, calc(100vw - 20px));
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   align-items: center;
   gap: 8px;
@@ -178,6 +179,7 @@ body {
 #new-golog-structure,
 #toggle-ui-panels,
 #iphone-tabs-toggle {
+  flex-shrink: 0;
   pointer-events: auto;
   border: 1px solid #384456;
   border-radius: 4px;
@@ -193,6 +195,9 @@ body {
 
 .virtual-double-tools {
   display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  max-width: 100%;
   overflow: hidden;
   border: 1px solid #40516b;
   border-radius: 4px;
@@ -205,6 +210,7 @@ body {
 }
 
 .virtual-double-tools button {
+  flex-shrink: 0;
   min-height: 32px;
   border: 0;
   border-right: 1px solid #40516b;
@@ -391,7 +397,7 @@ body {
 #shortcut-hints {
   position: absolute;
   z-index: 32;
-  top: 52px;
+  top: calc(var(--golog-toolbar-bottom, 42px) + 10px);
   right: 10px;
   left: auto;
   display: grid;
@@ -1066,20 +1072,36 @@ dd {
   opacity: 0.7;
 }
 
-.screen-reader-status {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
+#workspace-io-status {
+  position: fixed;
+  z-index: 100;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: min(520px, calc(100vw - 32px));
+  max-height: min(25vh, 8em);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  box-sizing: border-box;
+  padding: 9px 12px;
+  border: 1px solid #42556d;
+  border-radius: 6px;
+  background: rgba(12, 18, 27, 0.94);
+  color: #e6edf7;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+#workspace-io-status:empty {
+  display: none;
 }
 
 @media (max-width: 720px) {
   #shortcut-hints {
     right: 8px;
     left: auto;
-    top: 58px;
+    top: calc(var(--golog-toolbar-bottom, 48px) + 10px);
     width: min(232px, calc(100vw - 16px));
     gap: 5px;
   }
@@ -1098,7 +1120,8 @@ dd {
   }
 
   #golog-tabs {
-    max-width: min(50vw, calc(100% - 170px));
+    flex: 1 1 140px;
+    max-width: 100%;
   }
 
   #status-panel {
@@ -1289,7 +1312,7 @@ body[data-runtime-mode="iphone"] #iphone-tabs-toggle[aria-expanded="true"] {
 body[data-runtime-mode="iphone"] .iphone-tab-switcher:not([hidden]) {
   position: absolute;
   z-index: 28;
-  top: calc(max(8px, env(safe-area-inset-top)) + var(--mode-tab-height, 30px) + 8px);
+  top: calc(var(--golog-toolbar-bottom, 42px) + 8px);
   right: max(8px, env(safe-area-inset-right));
   display: flex;
   width: min(340px, calc(100vw - 16px));
@@ -1433,7 +1456,7 @@ body[data-runtime-mode="iphone"] .golog-nav-button {
 body[data-runtime-mode="iphone"] #iphone-drag-mode-toggle {
   position: absolute;
   z-index: 22;
-  top: calc(max(8px, env(safe-area-inset-top)) + var(--mode-tab-height, 30px) + 12px);
+  top: calc(var(--golog-toolbar-bottom, 42px) + 12px);
   right: max(8px, env(safe-area-inset-right));
   display: grid;
   place-items: center;

@@ -22,7 +22,8 @@ import {
 } from "./element-registry.js";
 
 const CAMERA_DISTANCE = 18;
-const CAMERA_MOVE_SPEED = 0.45;
+const CAMERA_MOVE_SPEED = 27;
+const CAMERA_MAX_FRAME_SECONDS = 0.1;
 const CAMERA_ORBIT_SPEED_DEFAULT = 6.65;
 const CAMERA_DRAG_SPEED_DEFAULT = 4.2;
 const CAMERA_CONTROL_SPEED_MIN = 0.1;
@@ -138,6 +139,7 @@ export class GologScene {
     this.centerInterestPoint = null;
     this.centerInterestMarker = null;
     this.disposed = false;
+    this.lastAnimationTime = null;
     this.releaseInputListeners = [];
     this.iphoneStableRenderSize = null;
     this.iphoneKeyboardViewportIntent = false;
@@ -343,6 +345,7 @@ export class GologScene {
     this.bus.on("virtual-cell:capture-toggle", () =>
       this.toggleVirtualCellCapture(),
     );
+    this.bus.on("virtual-cell:cancel", () => this.cancelVirtualCellCapture());
 
     this.hydrateFromState();
     this.attachInput();
@@ -2334,7 +2337,7 @@ export class GologScene {
   }
 
   onPointerDown(event) {
-    if (!this.active) {
+    if (!this.active || (event.button != null && event.button !== 0)) {
       return;
     }
     this.renderer.domElement.focus();
@@ -3032,10 +3035,17 @@ export class GologScene {
     if (!this.active) {
       return;
     }
+    if (event.key === "Escape" && this.virtualCellCapture.active) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      this.cancelVirtualCellCapture();
+      return;
+    }
     if (this.isEditableEventTarget(event.target)) {
       return;
     }
-    if (event.key === "r" || event.key === "R") {
+    if ((event.key === "r" || event.key === "R") &&
+      !event.ctrlKey && !event.metaKey && !event.altKey) {
       event.preventDefault();
       event.stopImmediatePropagation();
       if (!event.repeat) {
@@ -3052,7 +3062,8 @@ export class GologScene {
       event.preventDefault();
     }
     this.recordKey(event.key, true);
-    if (event.key === "e" || event.key === "E") {
+    if ((event.key === "e" || event.key === "E") &&
+      !event.ctrlKey && !event.metaKey && !event.altKey) {
       if (this.modeHead && !this.modeHead.canInspectNestedGolog()) {
         return;
       }
@@ -3145,6 +3156,11 @@ export class GologScene {
     return this.emitVirtualCellCaptureChanged();
   }
 
+  cancelVirtualCellCapture() {
+    this.virtualCellCapture = { active: false, edgeIds: [] };
+    return this.emitVirtualCellCaptureChanged();
+  }
+
   toggleVirtualCellCapture() {
     if (!this.modeHead?.usesVirtualDoubleCreation?.()) {
       return this.virtualCellCaptureSnapshot();
@@ -3152,6 +3168,9 @@ export class GologScene {
     if (!this.virtualCellCapture.active) {
       this.virtualCellCapture = { active: true, edgeIds: [] };
       return this.emitVirtualCellCaptureChanged();
+    }
+    if (this.virtualCellCapture.edgeIds.length === 0) {
+      return this.cancelVirtualCellCapture();
     }
     const boundary = this.state.inferVirtualCellBoundary?.(
       this.virtualCellCapture.edgeIds,
@@ -3743,7 +3762,13 @@ export class GologScene {
     });
   }
 
-  updateCameraFromKeys() {
+  updateCameraFromKeys(elapsedSeconds = 1 / 60) {
+    const seconds = Number.isFinite(elapsedSeconds)
+      ? THREE.MathUtils.clamp(elapsedSeconds, 0, CAMERA_MAX_FRAME_SECONDS)
+      : 0;
+    if (seconds === 0) {
+      return;
+    }
     const movement = new THREE.Vector3();
     if (this.keys.has("w") || this.keys.has("W")) {
       movement.add(this.cameraFrame.forward);
@@ -3768,7 +3793,7 @@ export class GologScene {
       return;
     }
 
-    movement.normalize().multiplyScalar(CAMERA_MOVE_SPEED);
+    movement.normalize().multiplyScalar(CAMERA_MOVE_SPEED * seconds);
     this.camera.position.add(movement);
     if (this.drag?.cameraOrbit && this.drag.focus) {
       this.drag.focus.add(movement);
@@ -3958,15 +3983,20 @@ export class GologScene {
     }
   }
 
-  animate() {
+  animate(timestamp) {
     if (this.disposed) {
       return;
     }
-    requestAnimationFrame(() => this.animate());
+    requestAnimationFrame((nextTimestamp) => this.animate(nextTimestamp));
     if (!this.active) {
+      this.lastAnimationTime = null;
       return;
     }
-    this.updateCameraFromKeys();
+    const elapsedSeconds = Number.isFinite(timestamp) && Number.isFinite(this.lastAnimationTime)
+      ? (timestamp - this.lastAnimationTime) / 1000
+      : 0;
+    this.lastAnimationTime = timestamp;
+    this.updateCameraFromKeys(elapsedSeconds);
     this.updateLabelRenderOrder();
     this.updatePayloadBillboardPreviewTransform();
     this.updateCenterInterestMarker();
