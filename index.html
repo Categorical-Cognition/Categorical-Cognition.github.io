@@ -1,17 +1,412 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Omnimodally Autopoietic Organizations</title>
-</head>
-<body>
-  <h1></h1> 
-  <ul>
-    <li><a href="https://www.youtube.com/@omnimodality" target="_blank">YouTube</a></li>
-    <li><a href="https://www-math.umd.edu/research/seminars/category-theory-and-cognition-seminar.html" target="_blank">Category Theory and Cognition Seminar</a></li>
-    <li><a href="https://signal.group/#CjQKIFdN_7SfeX1v9pb53cbbWhvj32GJ0MdV6gmuZ79_k-vkEhBmWDYisUzJQVqrVtaixbFo" target="_blank">Cognitive Cosmos Signal Chat</a></li>
-    <li><a href="https://omnimodal.org/refs" target="_blank">Cognitive Cosmos Signal Chat Reference List</a></li>
-
-  </ul>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JSGoLog</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  <script>globalThis.__GOLOG_RUNTIME_CONFIG={"developmentTools":false,"staticHosting":true,"shared":false,"sharedWorkspaceLoad":false,"serverWorkspaceSave":false,"hostedWorkspaces":[]};globalThis.__GOLOG_DEFAULT_URL_PARAMS={"startup":"blank","localSync":"0","authorityHost":"0"};</script></head>
+  <body>
+    <main id="app">
+      <div id="shortcut-hints" aria-label="Keyboard shortcuts">
+        <button
+          id="shortcut-hints-collapse"
+          class="panel-collapse-button"
+          type="button"
+          aria-label="Collapse keyboard shortcuts"
+          title="Collapse keyboard shortcuts"
+        >
+          x
+        </button>
+        <button class="shortcut-hint" type="button" data-shortcut-action="create" title="Shift-click to create or connect">
+          <span class="shortcut-icons" aria-hidden="true">
+            <span class="keycap keycap-wide">Shift</span>
+            <span class="mousecap"><span class="mousecap-button"></span></span>
+          </span>
+          <span class="shortcut-word">Create</span>
+        </button>
+        <button class="shortcut-hint shortcut-hint-wide" type="button" data-shortcut-action="move" title="W, A, S, D move">
+          <span class="shortcut-icons wasd-icons" aria-hidden="true">
+            <span class="keycap wasd-w">W</span>
+            <span class="keycap wasd-a">A</span>
+            <span class="keycap wasd-s">S</span>
+            <span class="keycap wasd-d">D</span>
+          </span>
+          <span class="shortcut-word">Move</span>
+        </button>
+        <button class="shortcut-hint" type="button" data-shortcut-action="force" title="F to toggle force layout" aria-pressed="true">
+          <span class="shortcut-icons" aria-hidden="true">
+            <span class="keycap">F</span>
+          </span>
+          <span class="shortcut-word">Force</span>
+        </button>
+        <button class="shortcut-hint" type="button" data-shortcut-action="save" title="Shift-S to save">
+          <span class="shortcut-icons" aria-hidden="true">
+            <span class="keycap keycap-wide">Shift</span>
+            <span class="keycap">S</span>
+          </span>
+          <span class="shortcut-word">Save</span>
+        </button>
+        <button class="shortcut-hint" type="button" data-shortcut-action="load" title="Shift-L to load">
+          <span class="shortcut-icons" aria-hidden="true">
+            <span class="keycap keycap-wide">Shift</span>
+            <span class="keycap">L</span>
+          </span>
+          <span class="shortcut-word">Load</span>
+        </button>
+        <button class="shortcut-hint" type="button" data-shortcut-action="labels" title="L to toggle labels" aria-pressed="true">
+          <span class="shortcut-icons" aria-hidden="true">
+            <span class="keycap">L</span>
+          </span>
+          <span class="shortcut-word">Labels</span>
+        </button>
+        <button class="shortcut-hint" type="button" data-shortcut-action="payload-media" title="Q to expand PNG payloads">
+          <span class="shortcut-icons" aria-hidden="true">
+            <span class="keycap">Q</span>
+          </span>
+          <span class="shortcut-word">Expand</span>
+        </button>
+        <div id="workspace-load-popover" class="shortcut-popover" hidden>
+          <select id="hosted-workspace-select" aria-label="Server golog"></select>
+          <button id="hosted-workspace-load" type="button">Server</button>
+          <button id="workspace-load-file" type="button">File</button>
+        </div>
+      </div>
+      <section id="scene-panel" aria-label="Golog 3D render test">
+        <div id="golog-tabbar" role="tablist" aria-label="Open gologs">
+          <button id="golog-nav-back" class="golog-nav-button" type="button" aria-label="Go back to previous golog" title="No previous golog" disabled>&lt;</button>
+          <button id="golog-nav-forward" class="golog-nav-button" type="button" aria-label="Go forward to next golog" title="No next golog" disabled>&gt;</button>
+          <div id="golog-tabs"></div>
+          <button
+            id="iphone-tabs-toggle"
+            type="button"
+            aria-expanded="false"
+            aria-controls="iphone-tab-switcher"
+            hidden
+          >
+            Tabs
+          </button>
+          <button id="open-meta-golog" type="button">Meta</button>
+          <div
+            id="virtual-double-tools"
+            class="virtual-double-tools"
+            aria-label="Virtual double category tools"
+            hidden
+          >
+            <button
+              type="button"
+              data-virtual-arrow-kind="tight"
+              aria-pressed="false"
+            >Tight</button>
+            <button
+              type="button"
+              data-virtual-arrow-kind="proarrow"
+              aria-pressed="true"
+            >Proarrow</button>
+            <button id="virtual-cell-capture" type="button" aria-pressed="false">
+              Cell
+            </button>
+          </div>
+          <select id="new-golog-structure" aria-label="New golog structure">
+            <option value="hierarchical-theta-space">Theta</option>
+            <option value="virtual-double-category">Virtual double</option>
+          </select>
+          <button id="create-golog" type="button">Create New Golog</button>
+          <button id="toggle-ui-panels" type="button">UI</button>
+        </div>
+        <div
+          id="iphone-tab-switcher"
+          class="iphone-tab-switcher"
+          aria-label="Open golog tabs"
+          hidden
+        >
+          <div class="iphone-tab-switcher-header">
+            <span>Tabs</span>
+            <button id="iphone-tabs-close" type="button" aria-label="Close tabs">
+              x
+            </button>
+          </div>
+          <div id="iphone-tab-list" class="iphone-tab-list"></div>
+        </div>
+        <button
+          id="iphone-drag-mode-toggle"
+          type="button"
+          aria-label="Switch to drag creation"
+          aria-pressed="false"
+          title="Drag rotates view"
+          hidden
+        >
+          R
+        </button>
+      </section>
+      <aside id="status-panel" hidden>
+        <button
+          id="iphone-selection-pane-expand"
+          class="iphone-selection-pane-toggle expand"
+          type="button"
+          aria-label="Expand selection panel"
+          title="Expand selection panel"
+        >
+          ^
+        </button>
+        <button
+          id="iphone-selection-pane-collapse"
+          class="iphone-selection-pane-toggle collapse"
+          type="button"
+          aria-label="Collapse selection panel"
+          title="Collapse selection panel"
+        >
+          v
+        </button>
+        <section id="interaction-panel" aria-label="Selected object">
+          <header class="selected-node-header">
+            <span class="selected-node-title">Object</span>
+            <span id="selected-readout">none</span>
+            <button
+              id="status-panel-collapse"
+              class="panel-collapse-button inline"
+              type="button"
+              aria-label="Collapse interaction panel"
+              title="Collapse interaction panel"
+            >
+              x
+            </button>
+          </header>
+          <label for="simplex-name-input">Name</label>
+          <input
+            id="simplex-name-input"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            disabled
+            placeholder="Select an object"
+          />
+          <dl class="selected-node-meta">
+            <div>
+              <dt>Anchor</dt>
+              <dd id="selected-node-position">0.0, 0.0, 0.0</dd>
+            </div>
+            <div>
+              <dt>Payload</dt>
+              <dd id="selected-node-payload">none</dd>
+            </div>
+          </dl>
+          <section id="delete-panel" class="delete-panel" aria-label="Delete selection" hidden>
+            <div class="delete-actions">
+              <button id="delete-object-plan" type="button">Delete...</button>
+              <button id="delete-object-confirm" class="danger" type="button" hidden>
+                Confirm Delete
+              </button>
+            </div>
+            <p id="delete-object-warning" class="delete-warning" aria-live="polite"></p>
+          </section>
+          <section id="payload-panel" aria-label="Selected simplex data" hidden>
+            <div id="payload-actions" class="payload-actions" hidden>
+              <button id="payload-add-text" type="button">Add Text</button>
+              <button id="payload-add-latex" type="button">Add LaTeX</button>
+              <button id="payload-add-code" type="button">Add Code</button>
+              <button id="payload-add-image" type="button">Add Image</button>
+              <button id="payload-add-url" type="button">Add URL</button>
+              <button id="payload-add-golog" type="button">Add Golog</button>
+              <button id="payload-associate-golog" type="button">
+                Associate Golog
+              </button>
+            </div>
+            <textarea
+              id="payload-text-editor"
+              spellcheck="true"
+              aria-label="Markdown data"
+              hidden
+            ></textarea>
+            <div id="payload-latex-view" hidden>
+              <textarea
+                id="payload-latex-editor"
+                spellcheck="false"
+                aria-label="LaTeX data"
+              ></textarea>
+              <div class="payload-latex-actions">
+                <button id="payload-compile-latex" type="button">
+                  Compile PNG
+                </button>
+                <button id="payload-open-latex-source" type="button">
+                  Open TeX
+                </button>
+                <button id="payload-open-latex-pdf" type="button">
+                  Open PNG
+                </button>
+              </div>
+              <p id="payload-latex-status" class="payload-latex-status"></p>
+              <div
+                id="payload-latex-preview"
+                class="payload-latex-preview"
+                aria-label="Compiled LaTeX preview"
+              ></div>
+            </div>
+            <div id="payload-code-view" hidden>
+              <select
+                id="payload-code-language"
+                aria-label="Code language"
+              >
+                <option value="javascript">JavaScript</option>
+                <option value="python">Python</option>
+                <option value="json">JSON</option>
+                <option value="html">HTML</option>
+                <option value="css">CSS</option>
+                <option value="text">Text</option>
+              </select>
+              <textarea
+                id="payload-code-editor"
+                spellcheck="false"
+                aria-label="Code data"
+              ></textarea>
+            </div>
+            <div id="payload-image-view" hidden>
+              <img id="payload-image-preview" alt="" />
+              <input
+                id="payload-image-alt"
+                type="text"
+                autocomplete="off"
+                placeholder="Alt text"
+              />
+              <button id="payload-image-replace" type="button">
+                Replace Image
+              </button>
+            </div>
+            <input
+              id="payload-image-input"
+              type="file"
+              accept="image/*"
+              hidden
+            />
+            <div id="payload-url-view" hidden>
+              <input
+                id="payload-url-input"
+                type="url"
+                autocomplete="url"
+                placeholder="https://example.com"
+                aria-label="URL"
+              />
+              <input
+                id="payload-url-title"
+                type="text"
+                autocomplete="off"
+                placeholder="Title"
+                aria-label="URL title"
+              />
+              <button id="payload-open-url" type="button">
+                Open URL
+              </button>
+            </div>
+            <div id="payload-golog-view" hidden>
+              <div
+                id="payload-golog-preview"
+                aria-label="Subgolog preview"
+              ></div>
+              <button id="payload-open-golog" type="button">
+                Open Subgolog
+              </button>
+            </div>
+          </section>
+        </section>
+      </aside>
+      <aside id="debug-panel" aria-label="Runtime controls">
+        <section class="debug-window">
+          <header class="debug-window-header">
+            <span>Runtime</span>
+            <button
+              id="debug-panel-collapse"
+              class="panel-collapse-button inline"
+              type="button"
+              aria-label="Collapse runtime controls"
+              title="Collapse runtime controls"
+            >
+              x
+            </button>
+            <button id="force-defaults-commit" type="button">
+              Commit Defaults
+            </button>
+            <button id="workspace-save-server" type="button" data-development-only>
+              Save Server
+            </button>
+            <button id="dev-reload-restore" type="button" data-development-only>
+              Reload JS
+            </button>
+          </header>
+          <section id="force-controls" class="force-controls" aria-label="Force tuning">
+            <header>Forces</header>
+            <label>
+              <span>Node gravity <output data-force-value="gravity">0.020</output></span>
+              <input data-force-setting="gravity" type="range" min="0" max="0.05" step="0.001" />
+            </label>
+            <label>
+              <span>Node repulsion <output data-force-value="repulsion">8.000</output></span>
+              <input data-force-setting="repulsion" type="range" min="0" max="20" step="0.1" />
+            </label>
+            <label>
+              <span>Edge pull <output data-force-value="edgePull">0.080</output></span>
+              <input data-force-setting="edgePull" type="range" min="0" max="0.2" step="0.002" />
+            </label>
+            <label>
+              <span>Edge plane <output data-force-value="edgePlaneGravity">0.035</output></span>
+              <input data-force-setting="edgePlaneGravity" type="range" min="0" max="0.2" step="0.002" />
+            </label>
+            <label>
+              <span>Plane repulsion <output data-force-value="samePlaneEdgeRepulsion">0.018</output></span>
+              <input data-force-setting="samePlaneEdgeRepulsion" type="range" min="0" max="0.2" step="0.002" />
+            </label>
+            <label>
+              <span>Opposite arrows <output data-force-value="oppositeArrowEdgeRepulsion">0.028</output></span>
+              <input data-force-setting="oppositeArrowEdgeRepulsion" type="range" min="0" max="0.2" step="0.002" />
+            </label>
+            <label>
+              <span>2-simplex nodes <output data-force-value="twoSimplexNodeBarycenter">0.001</output></span>
+              <input data-force-setting="twoSimplexNodeBarycenter" type="range" min="0" max="0.05" step="0.0005" />
+            </label>
+            <label>
+              <span>2-simplex edges <output data-force-value="twoSimplexEdgeBarycenter">0.002</output></span>
+              <input data-force-setting="twoSimplexEdgeBarycenter" type="range" min="0" max="0.05" step="0.0005" />
+            </label>
+            <label>
+              <span>2-face factor <output data-force-value="twoSimplexFaceTightening">1.80</output></span>
+              <input data-force-setting="twoSimplexFaceTightening" type="range" min="1" max="4" step="0.05" />
+            </label>
+            <label>
+              <span>Global coherence <output data-force-value="globalCoherence">0.080</output></span>
+              <input data-force-setting="globalCoherence" type="range" min="0" max="1" step="0.01" />
+            </label>
+          </section>
+          <section class="payload-debug-controls" aria-label="Payload rendering">
+            <header>Payloads</header>
+            <button id="payload-expand-all-media" type="button">
+              Expand PNGs
+            </button>
+            <output
+              id="payload-render-manifest-status"
+              class="debug-status"
+              aria-live="polite"
+            ></output>
+          </section>
+          <output id="force-defaults-status" class="debug-status" aria-live="polite"></output>
+        </section>
+      </aside>
+      <input
+        id="workspace-load-input"
+        type="file"
+        accept=".json,.golog,.golog.json,application/json"
+        hidden
+      />
+      <div id="workspace-io-status" class="screen-reader-status" aria-live="polite"></div>
+    </main>
+    <script type="importmap">{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js"
+  },
+  "integrity": {
+    "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js": "sha384-Qvl1RLjZOCDFOOH2bKcGnaDHMM8MVv3zVtMvhy3juQdiIOs6RgQ/7zYdM1FbpHzI"
+  }
+}
+</script>
+    <link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js" integrity="sha384-Qvl1RLjZOCDFOOH2bKcGnaDHMM8MVv3zVtMvhy3juQdiIOs6RgQ/7zYdM1FbpHzI" crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <script type="module" src="/src/public-main.js"></script>
+  </body>
 </html>
