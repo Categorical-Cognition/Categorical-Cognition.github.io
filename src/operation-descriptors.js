@@ -11,6 +11,8 @@ import {
 } from "./element-registry.js";
 import { assertShapeExpansionDeletionAllowed, assertShapeExpansionBoundaryEditAllowed } from "./shape-expansion.js";
 
+import { prepareWhiskeringPayload, createWhiskering, whiskeringObjectIds } from "./whiskering-creation.js";
+
 const OPERATION_ELEMENT_REGISTRY = createElementRegistry();
 
 export const CONVERGENCE_KINDS = Object.freeze({
@@ -168,16 +170,10 @@ function sphereDeleteWriteResources(context) {
 function layoutWriteResources(context) {
   return [
     ...gologScopedWriteResources(context),
-    ...(context.payload.positions ?? [])
-      .map((entry) =>
-        entry?.id ? simplexResourceId(context.gologId, entry.id) : null,
-      )
-      .filter(Boolean),
-    ...(context.payload.edgeControls ?? [])
-      .map((entry) =>
-        entry?.id ? simplexResourceId(context.gologId, entry.id) : null,
-      )
-      .filter(Boolean),
+    ...[...(context.payload.positions ?? []), ...(context.payload.edgeControls ?? []),
+      ...(context.payload.surfaceControls ?? [])]
+      .filter((entry) => entry?.id)
+      .map((entry) => simplexResourceId(context.gologId, entry.id)),
   ];
 }
 
@@ -251,6 +247,7 @@ function layoutClaimGroups({ gologId, payload }) {
   return [
     ...(payload.positions ?? []),
     ...(payload.edgeControls ?? []),
+    ...(payload.surfaceControls ?? []),
   ].map((entry) => claimGroup(simplexClaim(gologId, entry?.id)));
 }
 
@@ -285,7 +282,25 @@ function guardCommittedVolumeSupport(apply) {
   };
 }
 
+function whiskeringWriteResources({ gologId, payload }) {
+  return [gologResourceId(gologId), ...whiskeringObjectIds(payload).map((id) => simplexResourceId(gologId, id))];
+}
+
 const OPERATION_DESCRIPTOR_DEFINITIONS = {
+  "whiskering:create": {
+    convergence: DISCRETE_CONVERGENCE,
+    primaryResourceId: simplexPrimaryResource,
+    preparePayload: prepareWhiskeringPayload,
+    writeResources: whiskeringWriteResources,
+    requiredClaimGroups: ({ gologId, payload }) => whiskeringObjectIds(payload)
+      .map((id) => claimGroup(simplexClaim(gologId, id))),
+    apply: (store, payload, operation) => {
+      const declared = new Set(normalizeIds(operation.resourceIds ?? [operation.resourceId]));
+      if (whiskeringWriteResources({ gologId: operation.gologId, payload })
+        .some((id) => !declared.has(id))) return false;
+      return createWhiskering(store, payload, operation);
+    },
+  },
   "element:create": {
     convergence: DISCRETE_CONVERGENCE,
     primaryResourceId: elementCreatePrimaryResource,

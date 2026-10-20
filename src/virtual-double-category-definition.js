@@ -1,3 +1,4 @@
+import { normalizeControlDirection, normalizeFrameGauge, serializeFrameGauge } from "./frame-service.js";
 import * as THREE from "three";
 import {
   createObjectLabel,
@@ -182,6 +183,13 @@ export function resolveVirtualCellBoundary(
   store,
   { topPathIds, bottomArrowId, leftArrowId, rightArrowId } = {},
 ) {
+  const resolve = () => findVirtualCellBoundary(store, { topPathIds, bottomArrowId, leftArrowId, rightArrowId });
+  return store.resolveBoundary
+    ? store.resolveBoundary("virtual-cell", [topPathIds, bottomArrowId, leftArrowId, rightArrowId], resolve)
+    : resolve();
+}
+
+function findVirtualCellBoundary(store, { topPathIds, bottomArrowId, leftArrowId, rightArrowId }) {
   const topPath = (topPathIds ?? []).map((id) => store.edges.get(id));
   const bottomArrow = store.edges.get(bottomArrowId);
   const leftArrow = store.edges.get(leftArrowId);
@@ -412,7 +420,7 @@ export function createVirtualCellElement(
     nodeIds: [...boundary.nodeIds],
     controlCoordinate: Number(payload.controlCoordinate ?? 0),
     controlPoint: new THREE.Vector3(),
-    controlDirection: new THREE.Vector3(0, 0, 1),
+    controlDirection: normalizeControlDirection(payload.controlDirection) ?? new THREE.Vector3(0, 0, 1),
     render: { ...VIRTUAL_CELL_RENDER, ...(payload.render ?? {}) },
     handleRender: { ...VIRTUAL_CELL_HANDLE_RENDER },
   };
@@ -513,7 +521,7 @@ export function serializeVirtualDoubleElements(state) {
       dimension: 1,
       name: arrow.name ?? "",
       boundary: { sourceId: arrow.sourceId, targetId: arrow.targetId },
-      controlData: { bend: cloneArray(arrow.bend) },
+      controlData: { bend: cloneArray(arrow.bend), frame: serializeFrameGauge(state.objects.get(arrow.frameId)) },
     })),
     ...[...state.surfaces.values()].map((cell) => ({
       id: cell.id,
@@ -527,7 +535,7 @@ export function serializeVirtualDoubleElements(state) {
         leftArrowId: cell.leftArrowId,
         rightArrowId: cell.rightArrowId,
       },
-      controlData: { controlCoordinate: cell.controlCoordinate },
+      controlData: { controlCoordinate: cell.controlCoordinate, controlDirection: cloneArray(cell.controlDirection) },
     })),
   ];
 }
@@ -570,6 +578,7 @@ export function normalizeSerializedVirtualDoubleElement(
           record.controlData?.bend ?? record.bend ?? [0, 0],
           `${record.id}.bend`,
         ),
+        frame: normalizeFrameGauge(record.controlData?.frame),
       },
     };
   }
@@ -584,6 +593,7 @@ export function normalizeSerializedVirtualDoubleElement(
     },
     controlData: {
       controlCoordinate: Number(record.controlData?.controlCoordinate ?? 0),
+      controlDirection: normalizeControlDirection(record.controlData?.controlDirection),
     },
   };
 }
@@ -607,6 +617,7 @@ export function virtualDoubleCreationPayload(element) {
       sourceId: element.boundary.sourceId,
       targetId: element.boundary.targetId,
       bend: element.controlData.bend,
+      frame: element.controlData.frame,
     };
   }
   return {
@@ -616,6 +627,7 @@ export function virtualDoubleCreationPayload(element) {
     name: element.name,
     ...element.boundary,
     controlCoordinate: element.controlData.controlCoordinate,
+    controlDirection: element.controlData.controlDirection,
   };
 }
 

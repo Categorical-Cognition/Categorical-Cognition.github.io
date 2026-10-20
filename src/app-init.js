@@ -451,15 +451,24 @@ export function createGologApp({
       modeHead,
       createPreviewForceUniverse: ({ externalIntentProvider = null } = {}) =>
         new PreviewForceUniverse({
-          createForceLayout,
+          publicationMode: browserRuntimeConfig().staticHosting ? "local" : "shared",
+          createForceLayout: (child, options = {}) => createForceLayout(child, {
+            ...options, renderer: scene.renderer,
+            renderAdapter: (solver) => scene.bindPreviewForceLayout(child.id, solver),
+          }),
           settingsProvider: () => liveForceLayout?.settings ?? {},
           settingsBus: workspace.bus,
+          canRun: () => (liveForceLayout?.localPeerCanSolve() ?? true) && (modeHead?.canRunForces?.() ?? true),
           externalIntentProvider,
           frameRef: globalThis,
           origin: browserForceLayoutOrigin,
         }),
     });
     golog.scene = scene;
+    scene.prepareForceLayout = () => {
+      golog.bus.flush();
+      if (liveForceLayout?.activeGolog === golog && liveForceLayout.canRun()) liveForceLayout.layer.ensureController();
+    };
     scenes.set(golog.id, scene);
     golog.releaseNestedGologPreviewListener = golog.bus.on(
       "sphere:nested-golog-preview",
@@ -773,7 +782,16 @@ export function createGologApp({
     return golog;
   }
 
+  function flushLayout(gologId = null) {
+    if (!gologId || gologId === workspace.activeGologId) liveForceLayout?.flush();
+    for (const scene of scenes.values()) {
+      if (gologId) scene.previewForceUniverse?.entries.get(gologId)?.flush();
+      else scene.previewForceUniverse?.flush?.();
+    }
+  }
+
   function saveWorkspaceDocument() {
+    flushLayout();
     return stringifyWorkspaceDocument(workspace);
   }
 
@@ -1066,6 +1084,10 @@ export function createGologApp({
       store: golog.state,
       bus: golog.bus,
       origin: options.origin ?? browserRuntimeOrigin,
+      renderer: options.gpu ? options.renderer ?? golog.scene?.renderer : null,
+      renderAdapter: options.gpu ? options.renderAdapter ?? ((solver, flush, controller) => golog.scene?.bindForceLayout?.(
+        solver, () => liveForceLayout?.flush(), controller,
+      )) : null,
     });
   }
 
@@ -1160,6 +1182,7 @@ export function createGologApp({
     navigateBackGolog,
     navigateForwardGolog,
     createForceLayout,
+    flushLayout,
     saveWorkspaceDocument,
     loadWorkspaceDocumentText,
     devReloadWithRestore,
@@ -1200,6 +1223,7 @@ export function createGologApp({
     workspace,
     modeHead,
     createForceLayout,
+    publicationMode: browserRuntimeConfig().staticHosting ? "local" : "shared",
     origin: browserForceLayoutOrigin,
     peerProvider: () => localSync?.status?.().peers ?? [],
     localPeerProvider: () => localSync?.status?.().peer ?? localSyncConfig?.peerContext ?? null,
@@ -1243,6 +1267,7 @@ export function createGologApp({
     loadWorkspaceDocumentText,
     devReloadWithRestore,
     liveForceLayout: app.liveForceLayout,
+    flushLayout,
     agentApi: app.agentApi,
     initialHostedWorkspaceId: startupConfig?.hostedWorkspaceId ?? null,
     serverWorkspaceSave: developmentTools && browserRuntimeConfig().serverWorkspaceSave,

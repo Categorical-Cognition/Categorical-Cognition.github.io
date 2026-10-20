@@ -51,6 +51,8 @@ function cloneControlNet(controlNet) {
 function cloneSurfaceRecord(surface) {
   const baseRecord = {
     id: surface.id,
+    ownerId: surface.ownerId,
+    patchIndex: surface.patchIndex,
     render: { ...(surface.render ?? {}) },
   };
   if (surface.triangleControlNet) {
@@ -74,6 +76,32 @@ function cloneSurfaceRecord(surface) {
     secondControl: surface.secondControl.clone(),
     centerPoint: surface.centerPoint.clone(),
   };
+}
+
+function samplingMatrix(samples, triangular) {
+  const indices = triangular ? [[3,0,0], [2,1,0], [1,2,0], [0,3,0], [2,0,1],
+    [1,0,2], [0,0,3], [0,2,1], [0,1,2], [1,1,1]]
+    : Array.from({ length: 9 }, (_, index) => [Math.floor(index / 3), index % 3]);
+  const net = triangular ? Array.from({ length: 4 }, () => Array.from({ length: 4 }, () => Array(4)))
+    : Array.from({ length: 3 }, () => Array(3));
+  const points = indices.map((path) => {
+    const parent = path.slice(0, -1).reduce((value, index) => value[index], net);
+    return parent[path.at(-1)] = new THREE.Vector3();
+  });
+  const count = (samples + 1) ** 2, weights = new Float64Array(count * points.length);
+  // Evaluate the linear patch map on unit control nets once, preserving the
+  // existing polynomial convention without duplicating its coefficients.
+  points.forEach((point, term) => {
+    point.x = 1;
+    for (let vertex = 0; vertex < count; vertex++) {
+      const u = (vertex % (samples + 1)) / samples, v = Math.floor(vertex / (samples + 1)) / samples;
+      weights[vertex * points.length + term] = triangular
+        ? evaluateTriangularCubicBezierPatch(net, squareToTriangularBarycentric(u, v)).x
+        : evaluateBiquadraticBezierPatch(net, u, v).x;
+    }
+    point.x = 0;
+  });
+  return { indices, weights };
 }
 
 export class SurfaceBatchRenderer extends BatchedGeometryRenderer {
@@ -100,16 +128,20 @@ export class SurfaceBatchRenderer extends BatchedGeometryRenderer {
     this.verticesPerSurface = this.gridSize * this.gridSize;
     this.indicesPerSurface = samples * samples * 6;
     this.indicesPerItem = this.indicesPerSurface;
+    this.samplers = [samplingMatrix(samples, false), samplingMatrix(samples, true)];
 
     this.allocateBuffers(this.capacity);
   }
 
   upsertSurface(surface) {
+    this.renderVersion = (this.renderVersion ?? 0) + 1;
+    if (!this.records.has(surface.id)) this.topologyVersion = (this.topologyVersion ?? 0) + 1;
     const record = cloneSurfaceRecord(surface);
     this.upsertRecord(record.id, record);
   }
 
   removeSurface(id) {
+    if (this.records.has(id)) this.topologyVersion = (this.topologyVersion ?? 0) + 1;
     this.removeRecord(id);
   }
 
@@ -165,25 +197,19 @@ export class SurfaceBatchRenderer extends BatchedGeometryRenderer {
 
     const [red, green, blue] = colorComponents(surface.render.color);
     const opacity = surface.render.opacity ?? DEFAULT_SURFACE_OPACITY;
-    const controlNet = this.createControlNet(surface);
-
-    for (let row = 0; row < this.gridSize; row += 1) {
-      const v = row / this.samples;
-      for (let column = 0; column < this.gridSize; column += 1) {
-        const u = column / this.samples;
-        const point = surface.triangleControlNet
-          ? evaluateTriangularCubicBezierPatch(
-              controlNet,
-              squareToTriangularBarycentric(u, v),
-            )
-          : evaluateBiquadraticBezierPatch(controlNet, u, v);
-        const vertexIndex =
-          slot * this.verticesPerSurface + row * this.gridSize + column;
-        const vectorOffset = vertexIndex * 3;
-        this.positions.set(point.toArray(), vectorOffset);
-        this.colors.set([red, green, blue], vectorOffset);
-        this.opacities[vertexIndex] = opacity;
+    const controlNet = surface.triangleControlNet ?? surface.controlNet ?? this.createControlNet(surface);
+    const { indices, weights } = this.samplers[Number(Boolean(surface.triangleControlNet))];
+    const points = indices.map((path) => path.reduce((value, index) => value[index], controlNet));
+    for (let vertex = 0; vertex < this.verticesPerSurface; vertex++) {
+      let x = 0, y = 0, z = 0;
+      for (let term = 0; term < points.length; term++) {
+        const weight = weights[vertex * points.length + term], point = points[term];
+        x += weight * point.x; y += weight * point.y; z += weight * point.z;
       }
+      const vertexIndex = slot * this.verticesPerSurface + vertex, offset = vertexIndex * 3;
+      this.positions[offset] = x; this.positions[offset + 1] = y; this.positions[offset + 2] = z;
+      this.colors[offset] = red; this.colors[offset + 1] = green; this.colors[offset + 2] = blue;
+      this.opacities[vertexIndex] = opacity;
     }
 
     this.markSlotAttributesDirty(slot);

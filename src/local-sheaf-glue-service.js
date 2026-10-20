@@ -99,10 +99,10 @@ export class LocalSheafGlueService {
     return { ok: true, observed: targets.length };
   }
 
-  activeAuthorityRecords() {
+  activeAuthorityRecords({ localOnly = false } = {}) {
     const now = this.now();
     const localClaims = this.store?.resourceClaims?.snapshot?.() ?? [];
-    const remoteClaims = this.store?.authorityFabric?.activeRemoteClaims?.() ?? [];
+    const remoteClaims = localOnly ? [] : this.store?.authorityFabric?.activeRemoteClaims?.() ?? [];
     const byKey = new Map();
     for (const claim of [...localClaims, ...remoteClaims]) {
       if (!activeClaim(claim, now)) {
@@ -114,12 +114,12 @@ export class LocalSheafGlueService {
     return [...byKey.values()];
   }
 
-  activeInteractionRecords() {
+  activeInteractionRecords(options) {
     const changed = this.pruneObservedInteractions();
     if (changed) {
       this.emitChanged("observation-expired");
     }
-    const authorityRecords = this.activeAuthorityRecords()
+    const authorityRecords = this.activeAuthorityRecords(options)
       .filter(isHumanAuthority)
       .map((record) => ({
         ...cloneStoreValue(record),

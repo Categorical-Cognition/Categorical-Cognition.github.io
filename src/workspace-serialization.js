@@ -1,3 +1,4 @@
+import { normalizeControlDirection, normalizeFrameGauge, assertFrameTangent, frameGaugesEqual } from "./frame-service.js";
 import * as THREE from "three";
 import { cloneMetaGologState } from "./meta-golog-service.js";
 import { normalizePatchHistory } from "./workspace-patches.js";
@@ -18,7 +19,7 @@ export const GOLOG_WORKSPACE_VERSION = 1;
 export const THETA_SCHEMA = HIERARCHICAL_THETA_SPACE_SCHEMA;
 
 function vectorFromArray(value, fieldName) {
-  if (value?.isVector3) {
+  if (value?.isVector3 && value.toArray().every(Number.isFinite)) {
     return value.clone();
   }
   if (!Array.isArray(value) || value.length !== 3 || !value.every((n) => Number.isFinite(Number(n)))) {
@@ -28,7 +29,7 @@ function vectorFromArray(value, fieldName) {
 }
 
 function vector2FromArray(value, fieldName) {
-  if (value?.isVector2) {
+  if (value?.isVector2 && value.toArray().every(Number.isFinite)) {
     return value.clone();
   }
   if (!Array.isArray(value) || value.length !== 2 || !value.every((n) => Number.isFinite(Number(n)))) {
@@ -245,6 +246,8 @@ function normalizeGologRecord(record) {
 
   // Check the entire mathematical instance before hydration clears live state.
   presheafFromElements(definition.id, elements);
+  const nodePositions = new Map(elements.filter((element) => element.dimension === 0).map((element) => [element.id, element.position]));
+  const pairFrames = new Map();
   for (const element of elements) {
     const expected = DEFAULT_MATH_SCHEMA_REGISTRY.objectForElementKind(element.elementKind, element.schemaRef?.objectId);
     if (element.dimension !== expected.dimension) throw new Error(`Element dimension mismatch: ${element.id}`);
@@ -253,6 +256,13 @@ function normalizeGologRecord(record) {
     }
     if (element.boundary?.edgeIds && new Set(element.boundary.edgeIds).size !== element.boundary.edgeIds.length) {
       throw new Error(`The current renderer requires distinct boundary edges: ${element.id}`);
+    }
+    if (element.dimension === 1 && element.controlData.frame) {
+      const pair = [element.boundary.sourceId, element.boundary.targetId].sort();
+      const frame = normalizeFrameGauge(element.controlData.frame), key = JSON.stringify(pair);
+      assertFrameTangent(frame, ...pair.map((id) => nodePositions.get(id)));
+      if (pairFrames.has(key) && !frameGaugesEqual(pairFrames.get(key), frame)) throw new Error("Conflicting shared-pair frames");
+      pairFrames.set(key, frame);
     }
     if (element.dimension === 2 && !Number.isFinite(element.controlData.controlCoordinate)) {
       throw new Error(`Nonfinite surface coordinate: ${element.id}`);
@@ -288,6 +298,7 @@ function normalizeLegacyThetaCells(cells = {}) {
       sourceId: String(cell.sourceId),
       targetId: String(cell.targetId),
       bend: vector2FromArray(cell.bend ?? [0, 0], `${cell.id}.bend`),
+      frame: normalizeFrameGauge(cell.frame),
     })),
     two: (cells.two ?? []).map((cell) => ({
       id: String(cell.id),
@@ -295,6 +306,7 @@ function normalizeLegacyThetaCells(cells = {}) {
       type: cell.type ?? "two-cell",
       edgeIds: [...(cell.edgeIds ?? [])].map(String),
       controlCoordinate: Number(cell.controlCoordinate ?? 0),
+      controlDirection: normalizeControlDirection(cell.controlDirection),
     })),
   };
 }
@@ -333,11 +345,13 @@ export function hydrateWorkspaceFromDocument({
       gologsById.set(golog.id, golog);
     }
 
-    for (const gologRecord of normalized.gologs) {
-      hydrateGologState(gologsById.get(gologRecord.id).state, gologRecord);
-    }
-
-    applyWorkspaceAttachments(gologsById, normalized.attachments);
+    const releaseStateChanges = [...gologsById.values()].map(({ state }) => state.deferStateChanges());
+    try {
+      for (const gologRecord of normalized.gologs) {
+        hydrateGologState(gologsById.get(gologRecord.id).state, gologRecord);
+      }
+      applyWorkspaceAttachments(gologsById, normalized.attachments);
+    } finally { releaseStateChanges.forEach((release) => release()); }
 
     const firstGologId = normalized.gologs[0]?.id ?? null;
     const activeGologId = gologsById.has(normalized.activeGologId)
@@ -350,6 +364,9 @@ export function hydrateWorkspaceFromDocument({
     }
   });
   workspace.patchHistory.restore(normalized.patchHistory);
+  // A newly attached scene reads the completed snapshot. Deliver creation
+  // notifications first so that scene does not replay the loading history.
+  for (const { bus } of workspace.gologs.values()) bus.flush();
 
   return normalized;
 }

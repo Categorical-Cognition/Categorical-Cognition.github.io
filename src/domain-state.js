@@ -16,6 +16,7 @@ import * as THREE from "three";
 import {
   bendFromFramePoint as calculateBendFromFramePoint,
   createNodePairFrameGeometry,
+  normalizeControlDirection, normalizeFrameGauge, assertFrameTangent, frameGaugesEqual,
   pointFromFrameBend as calculatePointFromFrameBend,
 } from "./frame-service.js";
 import {
@@ -82,7 +83,7 @@ function coerceVector3Array(value, fieldName) {
 }
 
 function vector3FromStoreValue(value, fieldName) {
-  if (value?.isVector3) {
+  if (value?.isVector3 && value.toArray().every(Number.isFinite)) {
     return value.clone();
   }
   if (Array.isArray(value) && value.length === 3) {
@@ -115,6 +116,94 @@ function coerceVector2Array(value, fieldName) {
   return value.map(Number);
 }
 
+function structuralSignature(record) {
+  if (!record?.elementKind || !Number.isInteger(record.dimension)) return null;
+  const schema = record.schemaRef;
+  return JSON.stringify([record.elementKind, record.dimension, record.surfaceType, record.arrowKind,
+    schema && [schema.schemaId, schema.structureId, schema.objectId, schema.elementKind],
+    record.dimension === 1 ? [record.sourceId, record.targetId]
+      : record.dimension === 2 ? [record.edgeIds, record.topPathIds,
+        record.bottomArrowId, record.leftArrowId, record.rightArrowId]
+        : record.dimension === 3 ? Object.entries(record.faces ?? {}).sort(([a], [b]) => a.localeCompare(b)) : []]);
+}
+
+class IndexedObjectMap extends Map {
+  constructor() {
+    super();
+    this.boundary = new Map();
+    this.frame = new Map();
+    this.surface = new Map();
+    this.order = new Map();
+    this.nextOrder = 0;
+    this.topologyRevision = 0;
+    this.scopeRevision = 0;
+    this.signatures = new Map();
+  }
+
+  references(record) {
+    return [
+      record?.dimension === 1 ? [record.sourceId, record.targetId]
+        : record?.dimension === 2 ? record.edgeIds ?? [] : [],
+      record?.dimension === 1 ? [record.frameId] : [],
+      record?.dimension === 3 ? record.boundaryFaceIds ?? [] : [],
+    ];
+  }
+
+  updateReferences(id, previous, next) {
+    const before = this.references(previous), after = this.references(next);
+    [this.boundary, this.frame, this.surface].forEach((index, i) => {
+      for (const key of before[i]) if (key != null && !after[i].includes(key)) {
+        const ids = index.get(key);
+        if (!ids) continue;
+        ids.delete(id);
+        if (!ids.size) index.delete(key);
+      }
+      for (const key of after[i]) if (key != null && !before[i].includes(key)) {
+        if (!index.has(key)) index.set(key, new Set());
+        index.get(key).add(id);
+      }
+    });
+  }
+
+  set(id, record) {
+    const previous = this.get(id);
+    if (!this.has(id) || ["kind", "edgeId", "surfaceId", "frameId"].some((key) => previous?.[key] !== record?.[key])) {
+      this.scopeRevision++;
+    }
+    const signature = structuralSignature(record);
+    if ((this.signatures.get(id) ?? null) !== signature) this.topologyRevision++;
+    if (signature == null) this.signatures.delete(id);
+    else this.signatures.set(id, signature);
+    this.updateReferences(id, this.get(id), record);
+    if (!this.has(id)) this.order.set(id, this.nextOrder++);
+    return super.set(id, record);
+  }
+
+  delete(id) {
+    if (this.has(id)) this.scopeRevision++;
+    if (this.signatures.delete(id)) this.topologyRevision++;
+    this.updateReferences(id, this.get(id), null);
+    this.order.delete(id);
+    return super.delete(id);
+  }
+
+  clear() {
+    this.topologyRevision++;
+    this.scopeRevision++;
+    super.clear();
+    for (const index of [this.boundary, this.frame, this.surface, this.order, this.signatures]) index.clear();
+    this.nextOrder = 0;
+  }
+
+  incident(index, ids, collection) {
+    const selected = new Set();
+    for (const id of ids) for (const dependent of index.get(id) ?? []) selected.add(dependent);
+    // Rebased records retain their original collection order; union queries do too.
+    return [...selected].sort((a, b) => this.order.get(a) - this.order.get(b))
+      .map((id) => collection.get(id)).filter(Boolean);
+  }
+}
+
 export class SharedDomainStore {
   constructor(
     bus,
@@ -139,7 +228,7 @@ export class SharedDomainStore {
     this.volumes = new Map();
     this.payloads = new Map();
     this.payloadAttachments = new Map();
-    this.objects = new Map();
+    this.objects = new IndexedObjectMap();
     this.elementRegistry = createElementRegistry();
     this.locks = new Map();
     this.lockManager = new LockManager({ store: this, events: this.events });
@@ -194,7 +283,30 @@ export class SharedDomainStore {
 
   getPresheaf() {
     const definition = structureDefinitionFor(this.structure?.id ?? "hierarchical-theta-space");
-    return presheafFromElements(definition.id, definition.serializeElements(this));
+    if (this.presheafCache?.revision !== this.topologyRevision) {
+      this.presheafCache = { revision: this.topologyRevision,
+        value: presheafFromElements(definition.id, definition.serializeElements(this)) };
+    }
+    return this.presheafCache.value;
+  }
+
+  get topologyRevision() { return this.objects.topologyRevision; }
+
+  get structure() { return this._structure; }
+  set structure(value) {
+    if (this.objects && (this._structure?.id !== value?.id || this._structure?.schema !== value?.schema)) {
+      this.objects.topologyRevision++;
+    }
+    this._structure = value;
+  }
+
+  resolveBoundary(kind, ids, resolve) {
+    if (this.boundaryCache?.revision !== this.topologyRevision) {
+      this.boundaryCache = { revision: this.topologyRevision, values: new Map() };
+    }
+    const key = JSON.stringify([kind, ids]), values = this.boundaryCache.values;
+    if (!values.has(key)) values.set(key, resolve());
+    return values.get(key);
   }
 
   createElement(payload = {}) {
@@ -744,157 +856,111 @@ export class SharedDomainStore {
   }
 
   commitLayoutPositions(positions = [], client = {}) {
-    const entries = (positions ?? [])
-      .map((entry) => ({
-        id: String(entry?.id ?? ""),
-        position: vector3FromStoreValue(entry?.position, "layout position"),
-      }))
-      .filter((entry) => entry.id && this.spheres.has(entry.id));
-    const edgeEntries = (client.edgeControls ?? [])
-      .map((entry) => ({
-        id: String(entry?.id ?? ""),
-        midpoint: vector3FromStoreValue(entry?.midpoint, "layout edge midpoint"),
-      }))
-      .filter((entry) => entry.id && this.edges.has(entry.id));
-    if (entries.length === 0 && edgeEntries.length === 0) {
-      return { moved: [], edgeMoved: [] };
-    }
-
-    const lockIds = [
-      ...new Set(
-        [...entries, ...edgeEntries].flatMap((entry) =>
-          this.getLockScopeForObject(entry.id),
-        ),
-      ),
-    ];
-    if (!this.canMutateObjects(lockIds, client, "layout:commit")) {
-      return false;
-    }
-
-    const changedEdges = new Map();
-    for (const entry of entries) {
-      const sphere = this.spheres.get(entry.id);
-      sphere.position.copy(entry.position);
-      this.syncSphereObject(sphere);
-      for (const edge of this.connectedEdges(entry.id)) {
-        changedEdges.set(edge.id, edge);
-      }
-    }
-
-    for (const entry of entries) {
-      this.syncFramesForSphere(entry.id);
-    }
-    for (const edge of changedEdges.values()) {
-      this.syncEdgeObjects(edge);
-    }
-
-    const movedEdges = [];
-    for (const entry of edgeEntries) {
-      const edge = this.edges.get(entry.id);
-      const frame = this.syncNodePairFrame(edge.sourceId, edge.targetId);
-      edge.bend.copy(this.bendFromFramePoint(frame, entry.midpoint));
-      edge.midpoint.copy(this.pointFromFrameBend(frame, edge.bend));
-      this.syncEdgeObjects(edge);
-      changedEdges.set(edge.id, edge);
-      movedEdges.push({
-        id: edge.id,
-        midpoint: edge.midpoint.clone(),
-      });
-    }
-    const changedSurfaces = this.syncSurfacesForEdges([...changedEdges.values()]);
-
-    this.emitStateChanged();
-    for (const entry of entries) {
-      this.events.sphereMoved({ id: entry.id, position: entry.position });
-    }
-    for (const edge of changedEdges.values()) {
-      this.events.edgeMidpointMoved(this.edgeRenderPayload(edge));
-    }
-    for (const surface of changedSurfaces) {
-      this.events.surfaceUpdated(this.surfaceRenderPayload(surface));
-    }
-
-    return {
-      moved: entries.map((entry) => ({
-        id: entry.id,
-        position: entry.position.clone(),
-      })),
-      edgeMoved: movedEdges,
-    };
+    return this.applyLayoutCoordinates(positions, client.edgeControls, client.surfaceControls, client);
   }
 
-  applyLayoutPreviewPositions(positions = [], edgeControls = []) {
-    const entries = (positions ?? [])
-      .map((entry) => ({
-        id: String(entry?.id ?? ""),
-        position: vector3FromStoreValue(entry?.position, "layout preview position"),
-      }))
-      .filter((entry) => entry.id && this.spheres.has(entry.id));
-    const edgeEntries = (edgeControls ?? [])
-      .map((entry) => ({
-        id: String(entry?.id ?? ""),
-        midpoint: vector3FromStoreValue(entry?.midpoint, "layout preview edge midpoint"),
-      }))
-      .filter((entry) => entry.id && this.edges.has(entry.id));
+  applyLayoutPreviewPositions(positions = [], edgeControls = [], surfaceControls = []) {
+    return this.applyLayoutCoordinates(positions, edgeControls, surfaceControls);
+  }
 
-    const changedEdges = new Map();
-    const moved = [];
-    for (const entry of entries) {
-      const sphere = this.spheres.get(entry.id);
-      if (sphere.position.distanceToSquared(entry.position) <= 1e-12) {
-        continue;
+  applyLayoutCoordinates(positions = [], edgeControls = [], surfaceControls = [], client = null) {
+    // Validate the whole coordinate patch before changing any part of the store.
+    const entries = positions.map((entry) => ({
+      id: String(entry.id),
+      position: vector3FromStoreValue(entry.position, "layout position"),
+    })).filter((entry) => this.spheres.has(entry.id));
+    const edgeEntries = edgeControls.map((entry) => {
+      const bend = entry.bend == null ? null : new THREE.Vector2(
+        Number(entry.bend.x ?? entry.bend[0]), Number(entry.bend.y ?? entry.bend[1]),
+      );
+      if (bend && !bend.toArray().every(Number.isFinite)) {
+        throw new TypeError("Layout bend must contain finite coordinates");
       }
-      sphere.position.copy(entry.position);
-      this.syncSphereObject(sphere);
-      moved.push({
-        id: entry.id,
-        position: entry.position.clone(),
-      });
-      for (const edge of this.connectedEdges(entry.id)) {
-        changedEdges.set(edge.id, edge);
+      return {
+        id: String(entry.id), bend, frame: normalizeFrameGauge(entry.frame),
+        midpoint: bend ? null : vector3FromStoreValue(entry.midpoint, "layout edge midpoint"),
+      };
+    }).filter((entry) => this.edges.has(entry.id));
+    const surfaceEntries = surfaceControls.map((entry) => {
+      const controlCoordinate = Number(entry.controlCoordinate);
+      if (!Number.isFinite(controlCoordinate)) {
+        throw new TypeError("Layout surface coordinate must be finite");
       }
-    }
-
-    for (const entry of moved) {
-      this.syncFramesForSphere(entry.id);
-    }
-    for (const edge of changedEdges.values()) {
-      this.syncEdgeObjects(edge);
-    }
-
-    const edgeMoved = [];
-    for (const entry of edgeEntries) {
+      return { id: String(entry.id), controlCoordinate,
+        controlDirection: normalizeControlDirection(entry.controlDirection) };
+    }).filter((entry) => this.surfaces.has(entry.id));
+    const futurePositions = new Map(entries.map((entry) => [entry.id, entry.position]));
+    const pairGauges = new Map();
+    for (const entry of edgeEntries) if (entry.frame) {
       const edge = this.edges.get(entry.id);
-      if (edge.midpoint.distanceToSquared(entry.midpoint) <= 1e-12) {
-        continue;
+      // A coordinate publication may omit small endpoint motion. Transport its
+      // valid gauge to this store's boundary when restoring the shared frame.
+      const previous = pairGauges.get(edge.frameId);
+      if (previous && !frameGaugesEqual(previous.frame, entry.frame)) throw new TypeError("Conflicting shared-pair frames");
+      pairGauges.set(edge.frameId, { ...entry, edge });
+    }
+    const explicitEdges = new Set(edgeEntries.map((entry) => entry.id));
+    for (const { edge, frame } of pairGauges.values()) {
+      this.assertPairGaugePreservesPeers(edge.sourceId, edge.targetId, frame, futurePositions, explicitEdges);
+    }
+    if (client) {
+      const lockIds = [...new Set([...entries, ...edgeEntries, ...surfaceEntries]
+        .flatMap((entry) => this.getLockScopeForObject(entry.id)))];
+      if (!this.canMutateObjects(lockIds, client, "layout:commit")) return false;
+    }
+
+    const moved = [], edgeMoved = [], surfaceMoved = [];
+    const changedEdges = new Map(), changedSurfaces = new Map();
+    this.batchLayoutObjectUpdates(() => {
+      for (const entry of entries) {
+        const sphere = this.spheres.get(entry.id);
+        if (sphere.position.distanceToSquared(entry.position) <= 1e-12) continue;
+        sphere.position.copy(entry.position);
+        this.syncSphereObject(sphere);
+        moved.push({ id: entry.id, position: entry.position.clone() });
+        for (const edge of this.connectedEdges(entry.id)) changedEdges.set(edge.id, edge);
       }
-      const frame = this.syncNodePairFrame(edge.sourceId, edge.targetId);
-      edge.bend.copy(this.bendFromFramePoint(frame, entry.midpoint));
-      edge.midpoint.copy(this.pointFromFrameBend(frame, edge.bend));
-      this.syncEdgeObjects(edge);
-      changedEdges.set(edge.id, edge);
-      edgeMoved.push({
-        id: edge.id,
-        midpoint: edge.midpoint.clone(),
-      });
+      for (const entry of moved) this.syncFramesForSphere(entry.id);
+      for (const edge of changedEdges.values()) this.syncEdgeObjects(edge);
+      for (const { edge, frame } of pairGauges.values()) {
+        for (const peer of this.restoreNodePairFrameGauge(edge.sourceId, edge.targetId, frame)) changedEdges.set(peer.id, peer);
+      }
+      for (const entry of edgeEntries) {
+        const edge = this.edges.get(entry.id);
+        const frame = this.syncNodePairFrame(edge.sourceId, edge.targetId);
+        const bend = entry.bend ?? this.bendFromFramePoint(frame, entry.midpoint);
+        if (edge.bend.distanceToSquared(bend) <= 1e-12) continue;
+        edge.bend.copy(bend);
+        this.syncEdgeObjects(edge);
+        changedEdges.set(edge.id, edge);
+        edgeMoved.push({ id: edge.id, bend: edge.bend.clone(), midpoint: edge.midpoint.clone() });
+      }
+      for (const entry of surfaceEntries) if (entry.controlDirection) {
+        const surface = this.surfaces.get(entry.id);
+        if (surface.controlDirection.distanceToSquared(entry.controlDirection) > 1e-12) {
+          surface.controlDirection.copy(entry.controlDirection);
+          changedSurfaces.set(surface.id, surface);
+        }
+      }
+      for (const surface of this.surfacesForEdges([...changedEdges.values()])) {
+        changedSurfaces.set(surface.id, surface);
+      }
+      for (const entry of surfaceEntries) {
+        const surface = this.surfaces.get(entry.id);
+        if (Math.abs(surface.controlCoordinate - entry.controlCoordinate) <= 1e-12 && !changedSurfaces.has(surface.id)) continue;
+        surface.controlCoordinate = entry.controlCoordinate;
+        changedSurfaces.set(surface.id, surface);
+        surfaceMoved.push({ ...entry });
+      }
+      for (const surface of changedSurfaces.values()) this.syncSurfaceObjects(surface);
+    });
+    if (moved.length || changedEdges.size || changedSurfaces.size) {
+      this.emitStateChanged();
+      for (const entry of moved) this.events.sphereMoved(entry);
+      for (const edge of changedEdges.values()) this.events.edgeMidpointMoved(this.edgeRenderPayload(edge));
+      for (const surface of changedSurfaces.values()) this.events.surfaceUpdated(this.surfaceRenderPayload(surface));
     }
-    if (moved.length === 0 && edgeMoved.length === 0) {
-      return { moved: [], edgeMoved: [] };
-    }
-    const changedSurfaces = this.syncSurfacesForEdges([...changedEdges.values()]);
-
-    this.emitStateChanged();
-    for (const entry of moved) {
-      this.events.sphereMoved({ id: entry.id, position: entry.position });
-    }
-    for (const edge of changedEdges.values()) {
-      this.events.edgeMidpointMoved(this.edgeRenderPayload(edge));
-    }
-    for (const surface of changedSurfaces) {
-      this.events.surfaceUpdated(this.surfaceRenderPayload(surface));
-    }
-
-    return { moved, edgeMoved };
+    return { moved, edgeMoved, surfaceMoved };
   }
 
   createEdge(sourceId, targetId, options = {}) {
@@ -907,6 +973,12 @@ export class SharedDomainStore {
       return null;
     }
 
+    const gauge = normalizeFrameGauge(options.frame);
+    if (gauge) {
+      assertFrameTangent(gauge, ...this.nodePairEndpoints(sourceId, targetId).map((id) => this.spheres.get(id).position));
+      this.assertPairGaugePreservesPeers(sourceId, targetId, gauge);
+      this.restoreNodePairFrameGauge(sourceId, targetId, gauge);
+    }
     const frame = this.syncNodePairFrame(sourceId, targetId);
     const id = requestedId ?? `edge-${this.nextEdgeId++}`;
     this.reserveNumericId(id, "edge-", "nextEdgeId");
@@ -1068,13 +1140,11 @@ export class SharedDomainStore {
   }
 
   connectedEdges(sphereId) {
-    return [...this.edges.values()].filter(
-      (edge) => edge.sourceId === sphereId || edge.targetId === sphereId,
-    );
+    return this.objects.incident(this.objects.boundary, [sphereId], this.edges);
   }
 
   edgesForFrame(frameId) {
-    return [...this.edges.values()].filter((edge) => edge.frameId === frameId);
+    return this.objects.incident(this.objects.frame, [frameId], this.edges);
   }
 
   findAvailableEdgeBendForPair(sourceId, targetId) {
@@ -1186,6 +1256,10 @@ export class SharedDomainStore {
   }
 
   resolveComposableEdgeTriple(edgeIds) {
+    return this.resolveBoundary("triangle", edgeIds, () => this.findComposableEdgeTriple(edgeIds));
+  }
+
+  findComposableEdgeTriple(edgeIds) {
     const uniqueIds = [...new Set((edgeIds ?? []).filter(Boolean))];
     if (uniqueIds.length !== 3) {
       return null;
@@ -1251,16 +1325,19 @@ export class SharedDomainStore {
   }
 
   surfacesForEdge(edgeId) {
-    return [...this.surfaces.values()].filter((surface) =>
-      surface.edgeIds.includes(edgeId),
-    );
+    return this.objects.incident(this.objects.boundary, [edgeId], this.surfaces);
   }
 
   surfacesForEdges(edges) {
-    const edgeIds = new Set(edges.map((edge) => edge.id));
-    return [...this.surfaces.values()].filter((surface) =>
-      surface.edgeIds.some((edgeId) => edgeIds.has(edgeId)),
-    );
+    return this.objects.incident(this.objects.boundary, edges.map((edge) => edge.id), this.surfaces);
+  }
+
+  volumesForSurface(surfaceId) {
+    return this.volumesForSurfaces([surfaceId]);
+  }
+
+  volumesForSurfaces(surfaceIds) {
+    return this.objects.incident(this.objects.surface, surfaceIds, this.volumes);
   }
 
   syncSurfacesForEdges(edges) {
@@ -1389,7 +1466,7 @@ export class SharedDomainStore {
   }
 
   acquireInteractionLock(objectId, client = {}) {
-    const result = this.lockManager.acquireInteractionLock(objectId, client);
+    const result = this.lockManager.acquireLocks(this.getLockScopeForObject(objectId), client);
     if (result.ok) {
       this.workspace?.patchHistory?.beginInteraction(this, objectId);
     }
@@ -1412,7 +1489,9 @@ export class SharedDomainStore {
   }
 
   getLockScopeForObject(objectId) {
-    return this.lockManager.getLockScopeForObject(objectId);
+    // Helper membership affects lock scopes without changing mathematical topology.
+    return this.resolveBoundary("lock-scope", [this.objects.scopeRevision, objectId],
+      () => this.lockManager.getLockScopeForObject(objectId)).slice();
   }
 
   edgeLockScope(edgeId, { includeFrame = false, includeSurfaces = false } = {}) {
@@ -1432,15 +1511,18 @@ export class SharedDomainStore {
 
   canMutateObjects(objectIds, client = {}, operation = "mutation") {
     const ids = new Set(objectIds);
-    if (this.volumes.size) {
-      const seeds = [...ids].filter((id) => this.hasSelectableSimplex(id));
-      if (seeds.length) {
-        for (const { id } of this.getPresheaf().support(seeds)) {
-          if (this.volumes.has(id)) ids.add(id);
+    const scope = this.resolveBoundary("mutation-scope", [...ids], () => {
+      if (this.volumes.size) {
+        const seeds = [...ids].filter((id) => this.hasSelectableSimplex(id));
+        if (seeds.length) {
+          for (const { id } of this.getPresheaf().support(seeds)) {
+            if (this.volumes.has(id)) ids.add(id);
+          }
         }
       }
-    }
-    return this.lockManager.canMutateObjects([...ids], client, operation);
+      return [...ids];
+    });
+    return this.lockManager.canMutateObjects(scope, client, operation);
   }
 
   denyLock(objectIds, owner, reason, detail = {}) {
@@ -1683,7 +1765,39 @@ export class SharedDomainStore {
     }
   }
 
-  syncNodePairFrame(sourceId, targetId) {
+  assertPairGaugePreservesPeers(sourceId, targetId, gauge, positions = new Map(), excluded = new Set()) {
+    const frameId = this.nodePairFrameId(sourceId, targetId);
+    let oldFrame, nextFrame;
+    for (const edge of this.edgesForFrame(frameId)) if (!excluded.has(edge.id)) {
+      if (!oldFrame) {
+        const [firstPosition, secondPosition] = this.nodePairEndpoints(sourceId, targetId)
+          .map((id) => positions.get(id) ?? this.spheres.get(id).position);
+        oldFrame = createNodePairFrameGeometry({ firstPosition, secondPosition, existingFrame: this.objects.get(frameId) });
+        nextFrame = createNodePairFrameGeometry({ firstPosition, secondPosition, existingFrame: gauge });
+      }
+      const offset = this.pointFromFrameBend(oldFrame, edge.bend).sub(nextFrame.origin);
+      if (Math.abs(offset.dot(nextFrame.tangent)) > 1e-10 * (1 + offset.length())) {
+        throw new TypeError("A shared-pair gauge must preserve unlisted arrow geometry");
+      }
+    }
+  }
+
+  restoreNodePairFrameGauge(sourceId, targetId, gauge) {
+    const frameId = this.nodePairFrameId(sourceId, targetId);
+    const previous = this.objects.get(frameId);
+    if (previous && frameGaugesEqual(previous, gauge)) return [];
+    const peers = this.edgesForFrame(frameId);
+    const midpoints = peers.map((edge) => edge.midpoint.clone());
+    const frame = this.syncNodePairFrame(sourceId, targetId, gauge);
+    // Changing a shared gauge must not move other arrows sharing the pair.
+    peers.forEach((edge, index) => {
+      edge.bend.copy(this.bendFromFramePoint(frame, midpoints[index]));
+      this.syncEdgeObjects(edge);
+    });
+    return peers;
+  }
+
+  syncNodePairFrame(sourceId, targetId, gauge = null) {
     const [firstId, secondId] = this.nodePairEndpoints(sourceId, targetId);
     const first = this.spheres.get(firstId);
     const second = this.spheres.get(secondId);
@@ -1692,10 +1806,12 @@ export class SharedDomainStore {
     }
 
     const frameId = this.nodePairFrameId(sourceId, targetId);
+    const cached = this.layoutObjectBatch?.frames.get(frameId);
+    if (!gauge && cached) return cached;
     const geometry = createNodePairFrameGeometry({
       firstPosition: first.position,
       secondPosition: second.position,
-      existingFrame: this.objects.get(frameId),
+      existingFrame: gauge ?? this.objects.get(frameId),
     });
     const frame = createNodePairFrameRecord({
       id: frameId,
@@ -1703,6 +1819,7 @@ export class SharedDomainStore {
       ...geometry,
     });
     this.upsertObject(frame);
+    this.layoutObjectBatch?.frames.set(frameId, frame);
     return frame;
   }
 
@@ -1717,6 +1834,20 @@ export class SharedDomainStore {
     edge.frameId = frame.id;
     edge.midpoint.copy(this.pointFromFrameBend(frame, edge.bend));
 
+    const batch = this.layoutObjectBatch;
+    if (batch) {
+      batch.edges.set(edge.id, edge);
+      for (const id of [edge.id, this.edgeBendHandleId(edge.id)]) {
+        if (!batch.records.has(id)) batch.records.set(id, null);
+      }
+      return;
+    }
+    this.projectEdgeObjects(edge);
+  }
+
+  projectEdgeObjects(edge) {
+    const source = this.spheres.get(edge.sourceId);
+    const target = this.spheres.get(edge.targetId);
     const handleId = this.edgeBendHandleId(edge.id);
     const tangent = target.position.clone().sub(source.position).normalize();
     const controlPoint = this.getQuadraticControlPoint(
@@ -1818,14 +1949,38 @@ export class SharedDomainStore {
   upsertObject(record) {
     const clonedRecord = cloneStoreValue(record);
     this.objects.set(record.id, clonedRecord);
+    if (this.layoutObjectBatch) {
+      this.layoutObjectBatch.records.set(record.id, clonedRecord);
+      if (record.dimension === 2) this.layoutObjectBatch.surfaceIds.add(record.id);
+      return;
+    }
     this.events.objectUpserted(clonedRecord);
     if (record.dimension === 2 && this.volumes.size) {
-      for (const volume of this.volumes.values()) {
-        if (volume.boundaryFaceIds.includes(record.id)) {
-          syncThetaVolumeObject(this, volume);
-          this.events.volumeUpdated(this.getObject(volume.id));
-        }
+      for (const volume of this.volumesForSurface(record.id)) {
+        syncThetaVolumeObject(this, volume);
+        this.events.volumeUpdated(this.getObject(volume.id));
       }
+    }
+  }
+
+  batchLayoutObjectUpdates(update) {
+    if (this.layoutObjectBatch) return update();
+    // All endpoint positions are installed before frames are read. Publish each
+    // derived object once, after its complete boundary has reached the new state.
+    const batch = { records: new Map(), surfaceIds: new Set(), frames: new Map(), edges: new Map() };
+    this.layoutObjectBatch = batch;
+    const volumes = [];
+    try { return update(); }
+    finally {
+      try {
+        for (const edge of batch.edges.values()) this.projectEdgeObjects(edge);
+        for (const volume of this.volumesForSurfaces(batch.surfaceIds)) {
+          syncThetaVolumeObject(this, volume);
+          volumes.push(volume.id);
+        }
+      } finally { this.layoutObjectBatch = null; }
+      for (const record of batch.records.values()) this.events.objectUpserted(record);
+      for (const id of volumes) this.events.volumeUpdated(this.getObject(id));
     }
   }
 
@@ -1869,7 +2024,25 @@ export class SharedDomainStore {
   }
 
   emitStateChanged() {
+    if (this.stateChangeDeferrals) {
+      this.stateChangePending = true;
+      return;
+    }
     this.events.stateChanged(this.snapshot());
+  }
+
+  deferStateChanges() {
+    this.stateChangeDeferrals = (this.stateChangeDeferrals ?? 0) + 1;
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.stateChangeDeferrals--;
+      if (!this.stateChangeDeferrals && this.stateChangePending) {
+        this.stateChangePending = false;
+        this.emitStateChanged();
+      }
+    };
   }
 
   snapshotObjects() {

@@ -2,6 +2,7 @@ export class MessageBus {
   constructor() {
     this.handlers = new Map();
     this.queue = [];
+    this.queueHead = 0;
     this.isFlushing = false;
   }
 
@@ -22,16 +23,18 @@ export class MessageBus {
   }
 
   flush() {
-    while (this.queue.length > 0) {
-      const message = this.queue.shift();
-      const handlers = this.handlers.get(message.type);
-      if (!handlers) {
-        continue;
+    try {
+      while (this.queueHead < this.queue.length) {
+        const message = this.queue[this.queueHead];
+        this.queue[this.queueHead++] = null;
+        for (const handler of this.handlers.get(message.type) ?? []) {
+          handler(message.payload);
+        }
       }
-      for (const handler of handlers) {
-        handler(message.payload);
-      }
+    } finally {
+      this.queue.splice(0, this.queueHead);
+      this.queueHead = 0;
+      this.isFlushing = this.queue.length > 0;
     }
-    this.isFlushing = false;
   }
 }

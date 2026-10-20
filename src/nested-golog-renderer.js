@@ -13,6 +13,7 @@ export const DEFAULT_NESTED_PREVIEW_CONTENT_RADIUS = 1.85;
 
 export function disposeObject3D(object) {
   object.traverse?.((child) => {
+    child.userData?.disposeVolumeRenderer?.();
     child.geometry?.dispose?.();
     const materials = Array.isArray(child.material)
       ? child.material
@@ -23,12 +24,41 @@ export function disposeObject3D(object) {
   });
 }
 
+function previewInputKey(records, resident) {
+  const inputs = [];
+  for (const record of records) {
+    if (!["sphere", "edge", "surface", "two-simplex", "volume"].includes(record.kind)) continue;
+    inputs.push([record.id, record.kind, record.sourceId, record.targetId,
+      record.surfaceType, record.edgeIds, record.nodeIds, record.boundaryFaceIds,
+      ["surface", "two-simplex", "volume"].includes(record.kind)
+        ? [record.render?.color, record.render?.opacity, record.render?.samples] : null,
+      resident ? null : [record.position, record.midpoint, record.controlPoint,
+        record.triangleControlNet, record.controlNet, record.patchControlNets,
+        record.sourcePosition, record.targetPosition, record.firstControlPoint, record.secondControlPoint]]);
+  }
+  return JSON.stringify(inputs, (_key, value) =>
+    typeof value === "number" && !Number.isFinite(value) ? String(value) : value);
+}
+
 export class NestedGologContentRenderer {
   constructor({ contentRadius = DEFAULT_NESTED_PREVIEW_CONTENT_RADIUS } = {}) {
     this.contentRadius = contentRadius;
+    this.layers = new WeakMap();
   }
 
-  rebuildContent(content, childGolog) {
+  rebuildContent(content, childGolog, { resident = false } = {}) {
+    const topology = childGolog?.state.topologyRevision;
+    let snapshot;
+    const records = childGolog?.state.objects?.values()
+      ?? (snapshot = childGolog?.state.snapshot())?.objects ?? [];
+    // This runs on state/presentation events, never on resident animation frames.
+    // Names, payloads and selection do not change the unlabeled preview geometry.
+    const inputs = previewInputKey(records, resident);
+    const previous = this.layers.get(content);
+    if (previous && previous.golog === childGolog && previous.topology === topology
+      && previous.resident === resident && previous.inputs === inputs) return false;
+    this.layers.set(content, { golog: childGolog, topology, resident, inputs });
+    content.userData.layoutResourceVersion = (content.userData.layoutResourceVersion ?? 0) + 1;
     for (const child of [...content.children]) {
       content.remove(child);
       disposeObject3D(child);
@@ -41,10 +71,10 @@ export class NestedGologContentRenderer {
         scale: 1,
       };
       content.add(this.createEmptyMarker());
-      return;
+      return true;
     }
 
-    const snapshot = childGolog.state.snapshot();
+    snapshot ??= childGolog.state.snapshot();
     const objects = new Map(
       snapshot.objects.map((object) => [object.id, object]),
     );
@@ -53,12 +83,13 @@ export class NestedGologContentRenderer {
       points.push(edge.midpoint.clone());
     }
     for (const surface of snapshot.surfaces) {
-      points.push(...this.surfacePoints(objects.get(surface.id)));
+      points.push(surface.controlPoint.clone());
     }
     const transform = this.transformForPoints(points);
     content.userData.gologContentTransform = {
       center: transform.center.clone(),
       scale: transform.scale,
+      diameter: this.contentRadius * 2,
     };
 
     if (snapshot.volumes?.length) {
@@ -72,13 +103,13 @@ export class NestedGologContentRenderer {
         interactive: false,
         onStatus: ({ id, ...status }) => { content.userData.volumeDiagnostics[id] = status; },
       });
+      volumes.userData.disposeVolumeRenderer = () => renderer.dispose();
       for (const volume of snapshot.volumes) {
         renderer.upsert(projectVolumeRecord(objects.get(volume.id), {
           getObject: (id) => objects.get(id),
         }));
       }
-      // The preview owns this group. Its existing recursive disposal releases
-      // the shared renderer's meshes and materials on every rebuild or close.
+      // Recursive preview disposal releases this layer's shared geometry once.
       content.add(volumes);
     }
 
@@ -101,6 +132,7 @@ export class NestedGologContentRenderer {
     for (const sphere of snapshot.spheres) {
       content.add(this.createSphere(sphere, transform));
     }
+    return true;
   }
 
   createEmptyMarker() {
@@ -168,6 +200,7 @@ export class NestedGologContentRenderer {
     const mesh = new THREE.Mesh(geometry, material);
     mesh.name = `${sphere.id}-nested-preview-sphere`;
     mesh.userData.nonInteractive = true;
+    mesh.userData.layoutPointId = sphere.id;
     mesh.position.copy(this.mapPoint(sphere.position, transform));
     return mesh;
   }
@@ -186,6 +219,7 @@ export class NestedGologContentRenderer {
     const geometry = new THREE.BufferGeometry().setFromPoints(
       curve.getPoints(28),
     );
+    geometry.userData.layoutSamples = Array.from({ length: 29 }, (_, index) => ({ objectId: edge.id, t: index / 28 }));
     const material = new THREE.LineBasicMaterial({
       color: 0xff8f8f,
       transparent: true,
@@ -195,32 +229,6 @@ export class NestedGologContentRenderer {
     line.name = `${edge.id}-nested-preview-edge`;
     line.userData.nonInteractive = true;
     return line;
-  }
-
-  surfacePoints(surface) {
-    if (!surface) {
-      return [];
-    }
-    if (surface.triangleControlNet) {
-      return this.flattenPoints(surface.triangleControlNet);
-    }
-    if (surface.patchControlNets || surface.controlNet) {
-      return this.flattenPoints(surface.patchControlNets ?? surface.controlNet);
-    }
-    return [
-      surface.sourcePosition,
-      surface.targetPosition,
-      surface.firstControlPoint,
-      surface.secondControlPoint,
-      surface.controlPoint,
-    ].filter(Boolean);
-  }
-
-  flattenPoints(value) {
-    if (!Array.isArray(value)) {
-      return value?.isVector3 ? [value] : [];
-    }
-    return value.flatMap((entry) => this.flattenPoints(entry));
   }
 
   createSurface(surface, transform) {
@@ -236,11 +244,13 @@ export class NestedGologContentRenderer {
     const samples = Math.min(surface.render?.samples ?? 6, 8);
     const gridSize = samples + 1;
     const positions = [];
+    const layoutSamples = [];
     const indices = [];
     for (let row = 0; row < gridSize; row += 1) {
       const v = row / samples;
       for (let column = 0; column < gridSize; column += 1) {
         const u = column / samples;
+        layoutSamples.push({ objectId: surface.id, u, v });
         const point = surface.triangleControlNet
           ? evaluateTriangularCubicBezierPatch(
               controlNet,
@@ -262,6 +272,7 @@ export class NestedGologContentRenderer {
     }
 
     const geometry = new THREE.BufferGeometry();
+    geometry.userData.layoutSamples = layoutSamples;
     geometry.setAttribute(
       "position",
       new THREE.Float32BufferAttribute(positions, 3),
@@ -347,10 +358,7 @@ export class NestedGologPanelRenderer {
 
   setGolog(golog) {
     if (this.disposed) return;
-    if (this.golog?.id === golog?.id) {
-      this.rebuild();
-      return;
-    }
+    if (this.golog === golog && this.releaseListener) return;
 
     this.releaseListener?.();
     this.releaseListener = null;
@@ -363,8 +371,7 @@ export class NestedGologPanelRenderer {
 
   rebuild() {
     if (this.disposed) return;
-    this.contentRenderer.rebuildContent(this.group, this.golog);
-    this.render();
+    if (this.contentRenderer.rebuildContent(this.group, this.golog)) this.render();
   }
 
   render() {

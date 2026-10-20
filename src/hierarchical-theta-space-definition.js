@@ -1,3 +1,4 @@
+import { normalizeControlDirection, normalizeFrameGauge, serializeFrameGauge } from "./frame-service.js";
 import {
   createSurfaceControlHandleRecord,
   createSurfaceObjectRecord,
@@ -30,33 +31,6 @@ export const ELEMENT_KINDS = Object.freeze({
   TWO_SIMPLEX: "2-simplex",
   THETA_VOLUME: THETA_VOLUME_KIND,
 });
-
-const DEFAULT_TWO_SIMPLEX_FACE_TIGHTENING_FACTOR = 1.8;
-
-function finiteNumber(value, fallback) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
-}
-
-function finitePositiveNumber(value, fallback) {
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? number : fallback;
-}
-
-function cloneValue(value) {
-  if (value?.clone) {
-    return value.clone();
-  }
-  if (Array.isArray(value)) {
-    return value.map((entry) => cloneValue(entry));
-  }
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [key, cloneValue(entry)]),
-    );
-  }
-  return value;
-}
 
 function arrayFromVector(value) {
   return value?.toArray?.() ?? value;
@@ -118,302 +92,6 @@ export function defaultElementDefinitions() {
         return createTwoSimplexElement(store, payload.edgeIds, payload);
       },
     },
-  ];
-}
-
-function nodeElements(graph) {
-  const nodeIds = new Set(
-    graph.nodeIds ??
-      (graph.vertices ?? [])
-        .filter((vertex) => vertex.layoutKind !== "edge-control")
-        .map((vertex) => vertex.id),
-  );
-  return (graph.vertices ?? [])
-    .filter((vertex) => nodeIds.has(vertex.id))
-    .map((vertex) => ({
-      elementKind: ELEMENT_KINDS.ZERO_SIMPLEX,
-      id: vertex.id,
-      objectId: vertex.id,
-      declarations: [
-        {
-          kind: "body",
-          id: `body:${vertex.id}`,
-          objectId: vertex.id,
-          targetId: vertex.id,
-          mass: finiteNumber(vertex.mass, 1),
-          chargeScale: finitePositiveNumber(vertex.chargeScale, 1),
-          centerScale: finitePositiveNumber(vertex.centerScale, 1),
-          pinned: Boolean(vertex.pinned),
-          position: cloneValue(vertex.position),
-        },
-      ],
-    }));
-}
-
-function twoSimplexFacePower(edge) {
-  const counts = Array.isArray(edge.twoSimplexFaceCounts)
-    ? edge.twoSimplexFaceCounts
-    : [0, 0, 0];
-  return Number(counts[0] ?? 0) + Number(counts[2] ?? 0) - Number(counts[1] ?? 0);
-}
-
-function edgeFaceScale(edge, options = {}) {
-  const tighteningFactor = finitePositiveNumber(
-    options.twoSimplexFaceTighteningFactor ??
-      options.twoSimplexFaceTightenFactor,
-    DEFAULT_TWO_SIMPLEX_FACE_TIGHTENING_FACTOR,
-  );
-  return Math.pow(tighteningFactor, twoSimplexFacePower(edge));
-}
-
-function edgeElements(graph, options = {}) {
-  return (graph.edges ?? []).map((edge) => ({
-    elementKind: ELEMENT_KINDS.ONE_SIMPLEX,
-    id: edge.id,
-    objectId: edge.id,
-    declarations: [
-      (() => {
-        const scale = edgeFaceScale(edge, options);
-        return {
-          kind: "spring",
-          id: `spring:${edge.id}`,
-          objectId: edge.id,
-          sourceId: edge.sourceId,
-          targetId: edge.targetId,
-          restLength: finiteNumber(edge.restLength, 1) / scale,
-          strength: finiteNumber(edge.strength, 0) * scale,
-          twoSimplexFaceCounts: [...(edge.twoSimplexFaceCounts ?? [0, 0, 0])],
-          twoSimplexFaceScale: scale,
-        };
-      })(),
-    ],
-  }));
-}
-
-function edgeControlElements(graph, options = {}) {
-  const strength = finiteNumber(options.edgePlaneGravityStrength, 0);
-  if (strength === 0) {
-    return [];
-  }
-  return (graph.edgeControls ?? []).map((control) => ({
-    elementKind: `${ELEMENT_KINDS.ONE_SIMPLEX}:control`,
-    id: `${control.id}:edge-plane-gravity`,
-    objectId: control.id,
-    declarations: [
-      {
-        kind: "edge-plane-gravity",
-        id: `edge-plane-gravity:${control.id}`,
-        objectId: control.id,
-        targetId: control.id,
-        origin: cloneValue(control.frame.origin),
-        normal: cloneValue(control.frame.tangent),
-        strength,
-      },
-    ],
-  }));
-}
-
-function edgeControlCohorts(graph, options = {}) {
-  const samePlaneStrength = finiteNumber(options.samePlaneEdgeRepulsionStrength, 0);
-  const oppositeArrowStrength = finiteNumber(
-    options.oppositeArrowEdgeRepulsionStrength,
-    0,
-  );
-  if (samePlaneStrength === 0 && oppositeArrowStrength === 0) {
-    return [];
-  }
-
-  const cohorts = new Map();
-  for (const control of graph.edgeControls ?? []) {
-    const planeKey =
-      control.planeKey ?? control.cohortKey ?? control.homsetKey ?? control.frameId;
-    if (!cohorts.has(planeKey)) {
-      cohorts.set(planeKey, []);
-    }
-    cohorts.get(planeKey).push(control);
-  }
-
-  return [...cohorts.entries()].flatMap(([planeKey, controls]) => {
-    if (controls.length < 2) {
-      return [];
-    }
-    const controlRecords = controls.map((control) => ({
-      id: control.id,
-      sourceId: control.sourceId,
-      targetId: control.targetId,
-      bend: cloneValue(control.bend),
-    }));
-    const firstFrame = controls[0]?.frame;
-    const declarations = [];
-    if (samePlaneStrength !== 0) {
-      declarations.push({
-        kind: "edge-control-repulsion",
-        id: `same-plane-edge-repulsion:${planeKey}`,
-        planeKey,
-        controls: controlRecords,
-        normal: cloneValue(firstFrame?.tangent),
-        strength: samePlaneStrength,
-        minDistance: finiteNumber(options.edgeControlMinDistance, 0.18),
-      });
-    }
-    if (oppositeArrowStrength !== 0) {
-      declarations.push({
-        kind: "edge-control-repulsion",
-        id: `opposite-arrow-edge-repulsion:${planeKey}`,
-        planeKey,
-        controls: controlRecords,
-        normal: cloneValue(firstFrame?.tangent),
-        strength: oppositeArrowStrength,
-        minDistance: finiteNumber(options.edgeControlMinDistance, 0.18),
-        oppositeOnly: true,
-      });
-    }
-    return [
-      {
-        elementKind: `${ELEMENT_KINDS.ONE_SIMPLEX}:cohort`,
-        id: `${planeKey}:edge-control-cohort`,
-        objectId: null,
-        declarations,
-      },
-    ];
-  });
-}
-
-function higherConstraintElements(graph) {
-  return (graph.higherConstraints ?? []).map((constraint) => ({
-    elementKind:
-      constraint.type === SURFACE_TYPES.TWO_SIMPLEX
-        ? ELEMENT_KINDS.TWO_SIMPLEX
-        : "higher-constraint",
-    id: constraint.id,
-    objectId: constraint.id,
-    declarations: [
-      {
-        kind: "higher-constraint",
-        id: `higher-constraint:${constraint.id}`,
-        objectId: constraint.id,
-        constraintType: constraint.type,
-        edgeIds: [...(constraint.edgeIds ?? [])],
-        nodeIds: constraint.nodeIds ? [...constraint.nodeIds] : null,
-        strength: finiteNumber(constraint.strength, 0),
-      },
-    ],
-  }));
-}
-
-function twoSimplexBarycenterElements(graph, options = {}) {
-  const nodeStrength = finiteNumber(options.twoSimplexNodeBarycenterStrength, 0);
-  const edgeStrength = finiteNumber(options.twoSimplexEdgeBarycenterStrength, 0);
-  if (nodeStrength === 0 && edgeStrength === 0) {
-    return [];
-  }
-
-  return (graph.higherConstraints ?? [])
-    .filter((constraint) => constraint.type === SURFACE_TYPES.TWO_SIMPLEX)
-    .map((constraint) => {
-      const nodeIds = [...(constraint.nodeIds ?? [])];
-      const edgeIds = [...(constraint.edgeIds ?? [])];
-      return {
-        elementKind: `${ELEMENT_KINDS.TWO_SIMPLEX}:barycenter-force`,
-        id: `${constraint.id}:barycenter-force`,
-        objectId: constraint.id,
-        declarations: [
-          {
-            kind: "two-simplex-barycenter",
-            id: `two-simplex-barycenter:${constraint.id}`,
-            objectId: constraint.id,
-            nodeIds,
-            edgeIds,
-            targetIds: [...nodeIds, ...edgeIds],
-            nodeStrength,
-            edgeStrength,
-          },
-        ],
-      };
-    });
-}
-
-function objectDeclaredElements(graph) {
-  return (graph.forceSources ?? []).map((source, index) => ({
-    elementKind: source.elementKind ?? "object-declared",
-    id: source.id ?? `${source.objectId ?? "object"}:declaration-${index + 1}`,
-    objectId: source.objectId ?? null,
-    declarations: [
-      {
-        ...cloneValue(source),
-        kind: source.kind ?? "custom",
-      },
-    ],
-  }));
-}
-
-function globalFieldElements(graph, options = {}) {
-  const declarations = [];
-  const nodeIds =
-    graph.nodeIds ?? graph.vertices?.map((vertex) => vertex.id) ?? [];
-  const nodeIdSet = new Set(nodeIds);
-  const nodeVertices = (graph.vertices ?? []).filter((vertex) =>
-    nodeIdSet.has(vertex.id),
-  );
-  const chargeStrength = finiteNumber(options.chargeStrength, 1.8);
-  if (chargeStrength !== 0) {
-    declarations.push({
-      kind: "many-body",
-      id: "many-body:default",
-      strength: chargeStrength,
-      minDistance: finiteNumber(options.minChargeDistance, 0.35),
-      targetIds: [...nodeIds],
-      chargeScales: Object.fromEntries(
-        nodeVertices.map((vertex) => [
-          vertex.id,
-          finitePositiveNumber(vertex.chargeScale, 1),
-        ]),
-      ),
-      approximation: options.chargeApproximation ?? "pairwise",
-      cellSize: finiteNumber(options.chargeCellSize, 6),
-      nearCellRadius: finiteNumber(options.chargeNearCellRadius, 1),
-    });
-  }
-
-  const centerStrength = finiteNumber(options.centerStrength, 0.002);
-  if (centerStrength !== 0) {
-    declarations.push({
-      kind: "center",
-      id: "center:default",
-      center: cloneValue(options.center ?? [0, 0, 0]),
-      strength: centerStrength,
-      targetIds: [...nodeIds],
-      centerScales: Object.fromEntries(
-        nodeVertices.map((vertex) => [
-          vertex.id,
-          finitePositiveNumber(vertex.centerScale, 1),
-        ]),
-      ),
-    });
-  }
-
-  return declarations.length > 0
-    ? [
-        {
-          elementKind: "ambient-layout-field",
-          id: "ambient-layout-field",
-          objectId: null,
-          declarations,
-        },
-      ]
-    : [];
-}
-
-export function defaultElementProviders() {
-  return [
-    nodeElements,
-    edgeElements,
-    edgeControlElements,
-    edgeControlCohorts,
-    higherConstraintElements,
-    twoSimplexBarycenterElements,
-    objectDeclaredElements,
-    globalFieldElements,
   ];
 }
 
@@ -487,6 +165,7 @@ export function createTwoCellElement(
     id: requestedId = null,
     name = "",
     controlCoordinate = null,
+    controlDirection = null,
     schemaRef = null,
     render = null,
   } = {},
@@ -517,7 +196,7 @@ export function createTwoCellElement(
     frameId: frame.id,
     controlCoordinate: controlCoordinate ?? 0,
     controlPoint: frame.origin.clone(),
-    controlDirection: frame.u.clone(),
+    controlDirection: normalizeControlDirection(controlDirection) ?? frame.u.clone(),
     ...(render ? { render: { ...render } } : {}),
   };
 
@@ -552,6 +231,7 @@ export function createTwoSimplexElement(
     id: requestedId = null,
     name = "",
     controlCoordinate = null,
+    controlDirection = null,
     schemaRef = null,
     render = null,
   } = {},
@@ -580,7 +260,7 @@ export function createTwoSimplexElement(
     nodeIds: [resolved.source.id, resolved.middle.id, resolved.target.id],
     controlCoordinate: controlCoordinate ?? 0,
     controlPoint: resolved.source.position.clone().set(0, 0, 0),
-    controlDirection: resolved.source.position.clone().set(0, 0, 1),
+    controlDirection: normalizeControlDirection(controlDirection) ?? resolved.source.position.clone().set(0, 0, 1),
     ...(render ? { render: { ...render } } : {}),
   };
 
@@ -730,7 +410,7 @@ export function serializeHierarchicalThetaElements(state) {
       ...cell, position: arrayFromVector(cell.position),
     })),
     one: [...state.edges.values()].map((cell) => ({
-      ...cell, bend: arrayFromVector(cell.bend),
+      ...cell, bend: arrayFromVector(cell.bend), frame: serializeFrameGauge(state.objects.get(cell.frameId)),
     })),
     two: [...state.surfaces.values()],
   }), ...[...(state.volumes?.values() ?? [])].map(serializeThetaVolume)];
@@ -758,6 +438,7 @@ export function hierarchicalThetaElementsFromCells(cells) {
       },
       controlData: {
         bend: cell.bend,
+        ...(cell.frame ? { frame: cell.frame } : {}),
       },
     })),
     ...(cells?.two ?? []).map((cell) => ({
@@ -778,6 +459,7 @@ export function hierarchicalThetaElementsFromCells(cells) {
       },
       controlData: {
         controlCoordinate: cell.controlCoordinate,
+        ...(cell.controlDirection ? { controlDirection: arrayFromVector(cell.controlDirection) } : {}),
       },
     })),
   ];
@@ -800,6 +482,7 @@ export function hierarchicalThetaCellsFromElements(elements = []) {
         sourceId: element.boundary?.sourceId,
         targetId: element.boundary?.targetId,
         bend: element.controlData?.bend,
+        ...(element.controlData?.frame ? { frame: element.controlData.frame } : {}),
       })),
     two: elements
       .filter((element) => element.dimension === 2)
@@ -812,6 +495,7 @@ export function hierarchicalThetaCellsFromElements(elements = []) {
             : SURFACE_TYPES.TWO_CELL,
         edgeIds: [...(element.boundary?.edgeIds ?? [])],
         controlCoordinate: Number(element.controlData?.controlCoordinate ?? 0),
+        ...(element.controlData?.controlDirection ? { controlDirection: element.controlData.controlDirection } : {}),
       })),
   };
 }
@@ -884,6 +568,7 @@ export function normalizeSerializedHierarchicalThetaElement(
           record.controlData?.bend ?? record.bend ?? [0, 0],
           `${record.id}.bend`,
         ),
+        frame: normalizeFrameGauge(record.controlData?.frame ?? record.frame),
       },
     };
   }
@@ -903,6 +588,7 @@ export function normalizeSerializedHierarchicalThetaElement(
       controlCoordinate: Number(
         record.controlData?.controlCoordinate ?? record.controlCoordinate ?? 0,
       ),
+      controlDirection: normalizeControlDirection(record.controlData?.controlDirection ?? record.controlDirection),
     },
   };
 }
@@ -930,6 +616,7 @@ export function hierarchicalThetaCreationPayload(element) {
       sourceId: element.boundary.sourceId,
       targetId: element.boundary.targetId,
       bend: element.controlData.bend,
+      frame: element.controlData.frame,
     };
   }
   if (element.elementKind === ELEMENT_KINDS.TWO_SIMPLEX) {
@@ -940,6 +627,7 @@ export function hierarchicalThetaCreationPayload(element) {
       name: element.name,
       edgeIds: [...element.boundary.edgeIds],
       controlCoordinate: element.controlData.controlCoordinate,
+      controlDirection: element.controlData.controlDirection,
     };
   }
   return {
@@ -950,6 +638,7 @@ export function hierarchicalThetaCreationPayload(element) {
     firstEdgeId: element.boundary.edgeIds[0],
     secondEdgeId: element.boundary.edgeIds[1],
     controlCoordinate: element.controlData.controlCoordinate,
+      controlDirection: element.controlData.controlDirection,
   };
 }
 

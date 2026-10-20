@@ -1,622 +1,149 @@
 import * as THREE from "three";
-import { compileForceField, forceSpecsFromCompiledField } from "./force-field-compiler.js";
-import { nodePairEndpoints } from "./domain-object-definitions.js";
-import { createElementRegistry } from "./element-registry.js";
-import { createNodePairFrameGeometry } from "./frame-service.js";
+import { evaluateLayoutForces, normalizeLayoutSettings, refreshLayoutFrames } from "./layout-schema.js";
+import { layoutSnapshot } from "./layout-graph-extractor.js";
 
 export const FORCE_LAYOUT_STEP_FORMAT = "golog.force-layout-step";
-export const FORCE_LAYOUT_STEP_VERSION = 1;
-const DEFAULT_FORCE_DEADBAND = 0.0015;
-const DEFAULT_VELOCITY_DEADBAND = 0.0015;
+export const FORCE_LAYOUT_STEP_VERSION = 2;
 
-function finiteVector(value, fallback, Vector) {
-  const coordinates = Array.isArray(value) ? value : fallback.map(
-    (coordinate, index) => value?.[["x", "y", "z"][index]] ?? coordinate,
-  );
-  if (coordinates.length !== fallback.length || !coordinates.map(Number).every(Number.isFinite)) {
-    throw new TypeError("Layout coordinates must be finite numbers");
-  }
-  return new Vector(...coordinates.map(Number));
+// The public operation adapters still use vectors; packed solver state is numeric.
+export function layoutResult(ledger, diagnostics = {}, forces = null) {
+  const coordinates = Object.fromEntries(Object.entries(layoutSnapshot(ledger)).map(([key, entries]) =>
+    [key, entries.map((entry) => Object.fromEntries(Object.entries(entry).map(([name, value]) =>
+      [name, Array.isArray(value) && value.length === 3 ? new THREE.Vector3(...value)
+        : Array.isArray(value) && value.length === 2 ? new THREE.Vector2(...value) : value])))]));
+  return { format: FORCE_LAYOUT_STEP_FORMAT, version: FORCE_LAYOUT_STEP_VERSION,
+    gologId: ledger.gologId, tick: diagnostics.stepCount ?? 0, ...coordinates, diagnostics,
+    forceTotals: ledger.rows.filter((row) => row.dof).map((row) => ({ id: row.id,
+      force: new THREE.Vector3(...(forces?.subarray(row.index * 3, row.index * 3 + 3) ?? [0, 0, 0])) })) };
 }
 
-function vector3(value, fallback = [0, 0, 0]) {
-  return finiteVector(value, fallback, THREE.Vector3);
+const quantumValue = new Float32Array(1), quantumBits = new Uint32Array(quantumValue.buffer);
+function coordinateQuantum(coordinate, increment) {
+  quantumValue[0] = Math.max(Math.abs(coordinate), Math.abs(increment));
+  const exponent = (quantumBits[0] >>> 23) & 255;
+  quantumBits[0] = (Math.max(exponent, 24) - 23) << 23;
+  return quantumValue[0];
+}
+function roundEven(value) {
+  const lower = Math.floor(value), fraction = value - lower;
+  return fraction < .5 ? lower : fraction > .5 ? lower + 1 : lower + Math.abs(lower % 2);
 }
 
-function vector2(value, fallback = [0, 0]) {
-  return finiteVector(value, fallback, THREE.Vector2);
-}
-
-function solverNumber(value, fallback, name, maximum = Infinity) {
-  const number = Number(value ?? fallback);
-  if (!Number.isFinite(number) || number < 0 || number > maximum) {
-    throw new RangeError(`Invalid force solver ${name}: ${value}`);
-  }
-  return number;
-}
-
-function clampVectorLength(vector, maxLength) {
-  if (Number.isFinite(maxLength) && vector.lengthSq() > maxLength * maxLength) {
-    vector.setLength(maxLength);
-  }
-  return vector;
-}
-
-function integrate(position, velocity, force, pinned, options) {
-  if (pinned) {
-    velocity.multiplyScalar(0);
-    return;
-  }
-  velocity.multiplyScalar(options.damping).addScaledVector(force, options.dt);
-  clampVectorLength(velocity, options.maxVelocity);
-  zeroBelowDeadband(velocity, options.velocityDeadband);
-  position.addScaledVector(velocity, options.dt);
-}
-
-function deadbandThreshold(value, fallback) {
-  const number = Number(value);
-  return Number.isFinite(number) && number >= 0 ? number : fallback;
-}
-
-function positiveScale(value, fallback = 1) {
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? number : fallback;
-}
-
-function zeroBelowDeadband(vector, threshold) {
-  return threshold > 0 && vector.lengthSq() <= threshold * threshold
-    ? vector.set(0, 0, 0)
-    : vector;
-}
-
-function flattenIntents(value) {
-  if (!value) {
-    return [];
-  }
-  return Array.isArray(value) ? value.flatMap(flattenIntents) : [value];
-}
-
-function forceTargetIds(force, context) {
-  return Array.isArray(force.targetIds)
-    ? [...new Set(force.targetIds)].filter((id) => context.positions.has(id))
-    : context.vertexIds;
-}
-
-function bodyScale(context, id, scaleKey, explicitScales = null) {
-  const explicit = explicitScales?.[id];
-  if (explicit !== undefined) {
-    return positiveScale(explicit);
-  }
-  const body = context.bodiesById?.get(id);
-  const vertex = context.verticesById?.get(id);
-  return positiveScale(
-    body?.[scaleKey] ?? vertex?.[scaleKey] ?? body?.mass ?? vertex?.mass,
-    1,
-  );
-}
-
-function chargeScale(context, force, id) {
-  return bodyScale(context, id, "chargeScale", force.chargeScales);
-}
-
-function centerScale(context, force, id) {
-  return bodyScale(context, id, "centerScale", force.centerScales);
-}
-
-function edgeControlPoint(control, bend) {
-  return vector3(control?.frame?.origin)
-    .addScaledVector(vector3(control?.frame?.u, [1, 0, 0]), bend.x)
-    .addScaledVector(vector3(control?.frame?.v, [0, 1, 0]), bend.y);
-}
-
-function bendFromEdgeControlPoint(control, point) {
-  const origin = vector3(control?.frame?.origin);
-  const u = vector3(control?.frame?.u, [1, 0, 0]);
-  const v = vector3(control?.frame?.v, [0, 1, 0]);
-  const offset = vector3(point).sub(origin);
-  return new THREE.Vector2(offset.dot(u), offset.dot(v));
-}
-
-function edgeControlVectorToWorld(control, bendVector) {
-  return new THREE.Vector3()
-    .addScaledVector(vector3(control?.frame?.u, [1, 0, 0]), bendVector.x)
-    .addScaledVector(vector3(control?.frame?.v, [0, 1, 0]), bendVector.y);
-}
-
-// Antisymmetric, identity-based directions separate coincident bodies without
-// randomness or dependence on the peer's iteration order.
-function separationDirection(firstId, secondId, dimensions = 3) {
-  const forward = firstId < secondId;
-  const key = JSON.stringify(forward ? [firstId, secondId] : [secondId, firstId]);
-  let hash = 2166136261;
-  for (let index = 0; index < key.length; index += 1) {
-    hash = Math.imul(hash ^ key.charCodeAt(index), 16777619);
-  }
-  const angle = (hash >>> 0) / 0x100000000 * Math.PI * 2;
-  const direction = dimensions === 2
-    ? new THREE.Vector2(Math.cos(angle), Math.sin(angle))
-    : new THREE.Vector3(Math.cos(angle), Math.sin(angle), Math.sin(angle * 7)).normalize();
-  return direction.multiplyScalar(forward ? 1 : -1);
-}
-
-function repulsionVector(first, second, strength, minDistance, firstId, secondId) {
-  const delta = first.clone().sub(second);
-  const distanceSq = delta.lengthSq();
-  const direction = distanceSq > 0
-    ? delta.normalize()
-    : separationDirection(firstId, secondId, delta.isVector2 ? 2 : 3);
-  return direction.multiplyScalar(strength / Math.max(distanceSq, minDistance * minDistance));
-}
-
-function addPair(context, firstId, secondId, vector, coordinate = "world") {
-  context.add(firstId, vector, coordinate);
-  context.add(secondId, vector.clone().multiplyScalar(-1), coordinate);
-}
-
-function evaluateSpringForce(force, context) {
-  const source = context.positions.get(force.sourceId);
-  const target = context.positions.get(force.targetId);
-  if (!source || !target || force.sourceId === force.targetId) return;
-  const delta = target.clone().sub(source);
-  const distance = delta.length();
-  const direction = distance > 0
-    ? delta.multiplyScalar(1 / distance)
-    : separationDirection(force.targetId, force.sourceId);
-  addPair(context, force.sourceId, force.targetId,
-    direction.multiplyScalar((distance - Number(force.restLength ?? 1)) * Number(force.strength ?? 0)));
-}
-
-function evaluateChargeForce(force, context) {
-  const ids = forceTargetIds(force, context);
-  const strength = Number(force.strength ?? 1);
-  const minDistance = positiveScale(force.minDistance, 0.1);
-  for (let firstIndex = 0; firstIndex < ids.length; firstIndex += 1) {
-    for (let secondIndex = firstIndex + 1; secondIndex < ids.length; secondIndex += 1) {
-      const firstId = ids[firstIndex];
-      const secondId = ids[secondIndex];
-      addPair(context, firstId, secondId, repulsionVector(
-        context.positions.get(firstId), context.positions.get(secondId),
-        strength * chargeScale(context, force, firstId) * chargeScale(context, force, secondId),
-        minDistance, firstId, secondId,
-      ));
-    }
-  }
-}
-
-function createSpatialChargeCells(force, context) {
-  const cellSize = positiveScale(force.cellSize, 6);
-  const cells = new Map();
-  for (const id of forceTargetIds(force, context)) {
-    const position = context.positions.get(id);
-    const index = position.toArray().map((value) => Math.floor(value / cellSize));
-    const key = index.join(":");
-    if (!cells.has(key)) {
-      cells.set(key, { key, index, ids: [], centroid: new THREE.Vector3(), charge: 0 });
-    }
-    const cell = cells.get(key);
-    const scale = chargeScale(context, force, id);
-    cell.ids.push(id);
-    cell.charge += scale;
-    cell.centroid.addScaledVector(position, scale);
-  }
-  for (const cell of cells.values()) cell.centroid.multiplyScalar(1 / cell.charge);
-  return [...cells.values()];
-}
-
-function evaluateSpatialChargeForce(force, context) {
-  const cells = createSpatialChargeCells(force, context);
-  const strength = Number(force.strength ?? 1);
-  const minDistance = positiveScale(force.minDistance, 0.1);
-  const radius = Math.max(0, Number(force.nearCellRadius ?? 1));
-  // Visit each cell pair once. Far-cell forces are shared by charge, preserving
-  // equal-and-opposite total force just like the exact near-cell calculation.
-  for (let firstIndex = 0; firstIndex < cells.length; firstIndex += 1) {
-    const first = cells[firstIndex];
-    evaluateChargeForce({ ...force, targetIds: first.ids }, context);
-    for (let secondIndex = firstIndex + 1; secondIndex < cells.length; secondIndex += 1) {
-      const second = cells[secondIndex];
-      const near = first.index.every((value, axis) => Math.abs(value - second.index[axis]) <= radius);
-      if (near) {
-        for (const firstId of first.ids) {
-          for (const secondId of second.ids) {
-            addPair(context, firstId, secondId, repulsionVector(
-              context.positions.get(firstId), context.positions.get(secondId),
-              strength * chargeScale(context, force, firstId) * chargeScale(context, force, secondId),
-              minDistance, firstId, secondId,
-            ));
-          }
-        }
-      } else {
-        const vector = repulsionVector(first.centroid, second.centroid,
-          strength * first.charge * second.charge, minDistance, first.key, second.key);
-        for (const id of first.ids) {
-          context.add(id, vector.clone().multiplyScalar(chargeScale(context, force, id) / first.charge));
-        }
-        for (const id of second.ids) {
-          context.add(id, vector.clone().multiplyScalar(-chargeScale(context, force, id) / second.charge));
-        }
-      }
-    }
-  }
-}
-
-function evaluateCenterForce(force, context) {
-  const center = vector3(force.center);
-  for (const id of forceTargetIds(force, context)) {
-    context.add(id, center.clone().sub(context.positions.get(id))
-      .multiplyScalar(Number(force.strength ?? 0) * centerScale(context, force, id)));
-  }
-}
-
-function evaluateEdgePlaneGravityForce(force, context) {
-  const bend = context.edgeControlBends.get(force.targetId);
-  if (bend) context.add(force.targetId, bend.clone().multiplyScalar(-Number(force.strength ?? 0)), "edge-bend");
-}
-
-function evaluateEdgeControlRepulsionForce(force, context) {
-  const controls = (force.controls ?? []).filter((control) => context.edgeControlBends.has(control.id));
-  const strength = Number(force.strength ?? 0);
-  const minDistance = positiveScale(force.minDistance, 0.18);
-  if (strength === 0) return;
-  for (let firstIndex = 0; firstIndex < controls.length; firstIndex += 1) {
-    for (let secondIndex = firstIndex + 1; secondIndex < controls.length; secondIndex += 1) {
-      const first = controls[firstIndex];
-      const second = controls[secondIndex];
-      if (force.oppositeOnly && !(first.sourceId === second.targetId && first.targetId === second.sourceId)) continue;
-      addPair(context, first.id, second.id, repulsionVector(
-        context.edgeControlBends.get(first.id), context.edgeControlBends.get(second.id),
-        strength, minDistance, first.id, second.id,
-      ), "edge-bend");
-    }
-  }
-}
-
-function evaluateTwoSimplexBarycenterForce(force, context) {
-  const nodeIds = [...new Set(force.nodeIds ?? [])].filter(
-    (id) => context.positions.has(id) && !context.edgeControlsById.has(id),
-  );
-  if (nodeIds.length < 3) return;
-  const barycenter = nodeIds.reduce((sum, id) => sum.add(context.positions.get(id)), new THREE.Vector3())
-    .multiplyScalar(1 / nodeIds.length);
-  const nodeStrength = Number(force.nodeStrength ?? force.strength ?? 0);
-  const edgeStrength = Number(force.edgeStrength ?? force.strength ?? 0);
-  if (nodeStrength !== 0) {
-    for (const id of nodeIds) context.add(id,
-      barycenter.clone().sub(context.positions.get(id)).multiplyScalar(nodeStrength));
-  }
-  if (edgeStrength !== 0) {
-    for (const id of new Set(force.edgeIds ?? [])) {
-      const control = context.edgeControlsById.get(id);
-      if (control) context.add(id,
-        bendFromEdgeControlPoint(control, barycenter).sub(context.edgeControlBends.get(id))
-          .multiplyScalar(edgeStrength), "edge-bend");
-    }
-  }
-}
-
-const FORCE_EVALUATORS = {
-  spring: evaluateSpringForce,
-  charge: evaluateChargeForce,
-  "spatial-charge": evaluateSpatialChargeForce,
-  center: evaluateCenterForce,
-  "edge-plane-gravity": evaluateEdgePlaneGravityForce,
-  "edge-control-repulsion": evaluateEdgeControlRepulsionForce,
-  "two-simplex-barycenter": evaluateTwoSimplexBarycenterForce,
-};
-
-function addIntents(intents, context) {
-  for (const intent of flattenIntents(intents)) {
-    const normalized = vectorIntent(intent, context);
-    if (normalized) context.add(normalized.id, normalized.vector, normalized.coordinate);
-  }
-}
-
-function vectorIntent(intent, context) {
-  if (intent.kind === "edge-bend-vector") {
-    return {
-      id: intent.id,
-      vector: vector2(intent.vector),
-      coordinate: "edge-bend",
-      source: intent.source ?? "edge-force",
-    };
-  }
-  if (intent.kind === "vector") {
-    return {
-      id: intent.id,
-      vector: vector3(intent.vector),
-      coordinate: "world",
-      source: intent.source ?? "force",
-    };
-  }
-  if (intent.kind === "position") {
-    const current = context.positions.get(intent.id);
-    if (!current) {
-      return null;
-    }
-    return {
-      id: intent.id,
-      vector: vector3(intent.target).sub(current).multiplyScalar(intent.strength ?? 1),
-      coordinate: "world",
-      source: intent.source ?? "position-intent",
-    };
-  }
-  return null;
-}
-
+/** Reference executor for the same sparse coordinate ledger consumed by the GPU. */
 export class ForceLayoutSimulation {
-  constructor(graph, options = {}) {
-    this.graph = graph;
-    this.vertices = graph.vertices ?? [];
-    this.vertexIds = this.vertices.map((vertex) => vertex.id);
-    this.nodeIds =
-      graph.nodeIds ??
-      this.vertices
-        .filter((vertex) => vertex.layoutKind !== "edge-control")
-        .map((vertex) => vertex.id);
-    this.edgeControlIds =
-      graph.edgeControlIds ??
-      this.vertices
-        .filter((vertex) => vertex.layoutKind === "edge-control")
-        .map((vertex) => vertex.id);
-    const edgeControls =
-      graph.edgeControls ??
-      this.vertices.filter((vertex) => vertex.layoutKind === "edge-control");
-    this.edgeControlsById = new Map(
-      edgeControls.map((control) => [control.id, control]),
-    );
-    this.edgeControlBends = new Map(
-      edgeControls.map((control) => [control.id, vector2(control.bend)]),
-    );
-    this.edgeControlVelocities = new Map(
-      edgeControls.map((control) => [control.id, new THREE.Vector2()]),
-    );
-    this.positions = new Map(
-      this.vertices.map((vertex) => [vertex.id, vector3(vertex.position)]),
-    );
-    this.verticesById = new Map(
-      this.vertices.map((vertex) => [vertex.id, vertex]),
-    );
-    this.velocities = new Map(
-      this.vertices.map((vertex) => [vertex.id, new THREE.Vector3()]),
-    );
-    this.pinned = new Set(
-      this.vertices.filter((vertex) => vertex.pinned).map((vertex) => vertex.id),
-    );
-    this.options = {
-      ...options,
-      dt: solverNumber(options.dt, 0.6, "dt"),
-      damping: solverNumber(options.damping, 0.82, "damping", 1),
-      maxVelocity: solverNumber(options.maxVelocity, 1.2, "maxVelocity"),
-      forceDeadband: deadbandThreshold(
-        options.forceDeadband,
-        DEFAULT_FORCE_DEADBAND,
-      ),
-      velocityDeadband: deadbandThreshold(
-        options.velocityDeadband,
-        DEFAULT_VELOCITY_DEADBAND,
-      ),
-    };
-    this.elementRegistry =
-      options.elementRegistry ??
-      options.forceSourceRegistry ??
-      createElementRegistry();
-    this.elementDeclarations =
-      options.elementDeclarations ??
-      options.forceSources ??
-      this.elementRegistry.collect(graph, options);
-    this.forceSources = this.elementDeclarations;
-    this.forceField =
-      options.forceField ?? compileForceField(this.elementDeclarations, options);
-    this.bodiesById = new Map(
-      (this.forceField?.bodies ?? []).map((body) => [body.id, body]),
-    );
-    this.forces = options.forces ?? forceSpecsFromCompiledField(this.forceField);
-    this.lastForceTotals = new Map();
-    this.tick = 0;
-    this.syncEdgeControlWorldPositions();
+  constructor(ledger, options = {}) {
+    this.ledger = ledger;
+    this.options = normalizeLayoutSettings({ ...ledger.settings, ...options });
+    this.activeGroups = new Set(ledger.groups.map((_, index) => index));
+    this.quiet = new Uint32Array(ledger.groups.length);
+    this.targets = new Float32Array(ledger.rows.length * 4);
+    this.residue = new Float32Array(ledger.rows.length * 4);
+    this.stepCount = this.dispatchCount = 0;
   }
 
-  syncEdgeControlWorldPositions() {
-    for (const id of this.edgeControlIds) {
-      const control = this.edgeControlsById.get(id);
-      const bend = this.edgeControlBends.get(id);
-      if (!control || !bend) {
-        continue;
-      }
-      this.positions.set(id, edgeControlPoint(control, bend));
+  setOptions(options) { this.options = normalizeLayoutSettings({ ...this.options, ...options }); this.wake(); }
+  setTargets(targets) { this.targets.set(targets); this.wake(); }
+  setPins(ids = []) {
+    const pins = new Set(ids);
+    for (const row of this.ledger.rows) {
+      const at = row.index * 4, pinned = pins.has(row.id);
+      this.ledger.velocities[at + 3] = pinned ? 1 : 0;
+      if (pinned) { this.ledger.velocities.fill(0, at, at + 3); this.residue.fill(0, at, at + 3); }
     }
   }
-
-  refreshEdgeControlFrames() {
-    for (const id of this.edgeControlIds) {
-      const control = this.edgeControlsById.get(id);
-      if (!control) {
-        continue;
+  updateCoordinates(ids = []) {
+    for (const id of ids) {
+      const row = this.ledger.rows[this.ledger.idToIndex.get(id)];
+      if (row) {
+        this.ledger.velocities.fill(0, row.index * 4, row.index * 4 + 3);
+        this.residue.fill(0, row.index * 4, row.index * 4 + 3);
       }
-      const [firstId, secondId] = nodePairEndpoints(
-        control.sourceId,
-        control.targetId,
-      );
-      const firstPosition = this.positions.get(firstId);
-      const secondPosition = this.positions.get(secondId);
-      if (!firstPosition || !secondPosition) {
-        continue;
-      }
-      const geometry = createNodePairFrameGeometry({
-        firstPosition,
-        secondPosition,
-        existingFrame: control.frame,
-      });
-      control.frame = {
-        ...control.frame,
-        ...geometry,
-      };
     }
+    refreshLayoutFrames(this.ledger);
+    this.wake(ids);
+  }
+  wake(ids = null) {
+    const groups = ids == null ? this.ledger.groups.map((_, index) => index)
+      : [...ids].map((id) => this.ledger.rows[this.ledger.idToIndex.get(id)]?.group).filter((group) => group != null);
+    for (const group of groups) { this.activeGroups.add(group); this.quiet[group] = 0; }
   }
 
-  applyPositionEvents(events = []) {
-    const edgeEvents = [];
-    const pinnedForStep = new Set();
-    for (const event of events) {
-      if (!this.positions.has(event.id)) {
-        continue;
+  step(options = {}) {
+    const count = typeof options === "number" ? options : 1;
+    for (let iteration = 0; iteration < count && this.activeGroups.size; iteration++) {
+      refreshLayoutFrames(this.ledger, this.activeGroups);
+      const { forces, stiffness } = evaluateLayoutForces(this.ledger, this.options, this.activeGroups);
+      const { coordinates: q, velocities: v, rows, groups } = this.ledger;
+      const quiet = new Uint8Array(groups.length).fill(1);
+      const o = this.options;
+      for (const row of rows) {
+        if (!this.activeGroups.has(row.group)) continue;
+        const at = row.index * 4, forceAt = row.index * 3;
+        if (!row.dof || v[at + 3]) { v.fill(0, at, at + 3); this.residue.fill(0, at, at + 3); continue; }
+        const weight = this.targets[at + 3];
+        for (let axis = 0; axis < row.dof; axis++) forces[forceAt + axis] += weight * (this.targets[at + axis] - q[at + axis]);
+        const k = stiffness[row.index] + weight;
+        const frequency = Math.sqrt(k), dt = Math.min(o.dt, 0.5 / Math.max(frequency, 1e-4));
+        const damping = 2 * o.dampingRatio * frequency;
+        const wdt = frequency * dt, decay = Math.exp(-wdt);
+        const response = wdt < .01 ? wdt * wdt * (.5 - wdt / 3 + wdt * wdt / 8 - wdt * wdt * wdt / 30)
+          : 1 - (1 + wdt) * decay;
+        let forceSquared = 0, velocitySquared = 0;
+        for (let axis = 0; axis < row.dof; axis++) forceSquared += forces[forceAt + axis] ** 2;
+        const restingForce = forceSquared <= o.forceThreshold ** 2;
+        for (let axis = 0; axis < row.dof; axis++) {
+          const force = restingForce ? 0 : forces[forceAt + axis];
+          const velocity = v[at + axis];
+          let delta;
+          if (o.dampingRatio === 1 && k > 1e-8) {
+            delta = velocity * dt * decay + force / k * response;
+            v[at + axis] = (velocity * (1 - wdt) + force * dt) * decay;
+          } else if (k <= 1e-8) {
+            delta = velocity * dt + force * dt * dt / 2;
+            v[at + axis] += force * dt;
+          } else {
+            v[at + axis] = (velocity + dt * force) / (1 + dt * damping);
+            delta = dt * v[at + axis];
+          }
+          // Retain sub-ULP motion with the same explicit rounding as the GPU.
+          const increment = Math.fround(Math.fround(delta) + this.residue[at + axis]);
+          const quantum = coordinateQuantum(q[at + axis], increment);
+          const rounded = roundEven(increment / quantum) * quantum;
+          this.residue[at + axis] = increment - rounded;
+          q[at + axis] += rounded;
+          velocitySquared += v[at + axis] ** 2;
+        }
+        if (!restingForce || velocitySquared > o.velocityThreshold ** 2) quiet[row.group] = 0;
       }
-      if (event.pinned || event.pin || event.holdPosition) {
-        pinnedForStep.add(event.id);
+      for (const group of this.activeGroups) {
+        this.quiet[group] = quiet[group] ? this.quiet[group] + 1 : 0;
+        if (this.quiet[group] < o.sleepSteps) continue;
+        this.activeGroups.delete(group);
+        for (const index of groups[group]) {
+          v.fill(0, index * 4, index * 4 + 3);
+          this.residue.fill(0, index * 4, index * 4 + 3);
+        }
       }
-      if (this.edgeControlsById.has(event.id)) {
-        edgeEvents.push(event);
-        continue;
-      }
-      this.positions.set(event.id, vector3(event.position));
-      if (event.resetVelocity !== false || pinnedForStep.has(event.id)) {
-        this.velocities.set(event.id, new THREE.Vector3());
-      }
+      this.lastForces = forces;
+      this.stepCount++; this.dispatchCount++;
     }
-    this.refreshEdgeControlFrames();
-    for (const event of edgeEvents) {
-      const control = this.edgeControlsById.get(event.id);
-      const point = event.midpoint ?? event.position;
-      if (point || event.bend) {
-        this.edgeControlBends.set(
-          event.id,
-          event.bend ? vector2(event.bend) : bendFromEdgeControlPoint(control, point),
-        );
-        this.positions.set(
-          event.id,
-          edgeControlPoint(control, this.edgeControlBends.get(event.id)),
-        );
-      }
-      if (event.resetVelocity !== false || pinnedForStep.has(event.id)) {
-        this.edgeControlVelocities.set(event.id, new THREE.Vector2());
-      }
-    }
-    this.syncEdgeControlWorldPositions();
-    return pinnedForStep;
+    refreshLayoutFrames(this.ledger);
+    return this.snapshot();
   }
 
-  context() {
-    return {
-      graph: this.graph,
-      vertexIds: this.vertexIds,
-      nodeIds: this.nodeIds,
-      edgeControlIds: this.edgeControlIds,
-      edgeControlBends: this.edgeControlBends,
-      edgeControlsById: this.edgeControlsById,
-      positions: this.positions,
-      velocities: this.velocities,
-      verticesById: this.verticesById,
-      bodiesById: this.bodiesById,
-      tick: this.tick,
-    };
+  diagnostics() {
+    return { backend: "cpu-reference", stepCount: this.stepCount, dispatchCount: this.dispatchCount,
+      activeGroupCount: this.activeGroups.size, sleepingGroupCount: this.ledger.groups.length - this.activeGroups.size,
+      bodyCount: this.ledger.rows.length, groupCount: this.ledger.groups.length,
+      subscriptionCount: this.ledger.rows.reduce((n, row) => n + row.cofaceSources.length, 0),
+      interactionWork: { ...this.ledger.work },
+      topologyVersion: this.ledger.topologyVersion ?? 0 };
   }
-
-  step({ externalIntents = [], positionEvents = [] } = {}) {
-    const pinnedForStep = this.applyPositionEvents(positionEvents);
-    const context = this.context();
-    const accumulators = new Map(
-      this.vertexIds.map((id) => [id, new THREE.Vector3()]),
-    );
-    const edgeBendAccumulators = new Map(
-      this.edgeControlIds.map((id) => [id, new THREE.Vector2()]),
-    );
-    let intentCount = 0;
-    context.add = (id, vector, coordinate = "world") => {
-      if (!accumulators.has(id)) return;
-      if (![vector.x, vector.y, ...(vector.isVector2 ? [] : [vector.z])].every(Number.isFinite)) {
-        throw new TypeError(`Non-finite force for ${id}`);
-      }
-      const control = this.edgeControlsById.get(id);
-      if (control) {
-        // All forces on a control meet in its bend plane before deadbanding.
-        const bendVector = coordinate === "edge-bend" ? vector : new THREE.Vector2(
-          vector.dot(vector3(control.frame.u)), vector.dot(vector3(control.frame.v)),
-        );
-        edgeBendAccumulators.get(id).add(bendVector);
-      } else if (coordinate === "world") {
-        accumulators.get(id).add(vector);
-      } else return;
-      intentCount += 1;
-    };
-    for (const force of this.forces) {
-      if (typeof force.evaluate === "function") addIntents(force.evaluate(context), context);
-      else FORCE_EVALUATORS[force.kind]?.(force, context);
-    }
-    addIntents(externalIntents, context);
-    for (const vector of accumulators.values()) {
-      zeroBelowDeadband(vector, this.options.forceDeadband);
-    }
-    for (const vector of edgeBendAccumulators.values()) {
-      zeroBelowDeadband(vector, this.options.forceDeadband);
-    }
-    this.lastForceTotals = new Map(
-      [...accumulators.entries()].map(([id, vector]) => [id, vector.clone()]),
-    );
-    for (const [id, vector] of edgeBendAccumulators.entries()) {
-      this.lastForceTotals.set(
-        id,
-        edgeControlVectorToWorld(this.edgeControlsById.get(id), vector),
-      );
-    }
-
-    for (const id of this.nodeIds) {
-      integrate(this.positions.get(id), this.velocities.get(id), accumulators.get(id),
-        this.pinned.has(id) || pinnedForStep.has(id), this.options);
-    }
-    this.refreshEdgeControlFrames();
-    for (const id of this.edgeControlIds) {
-      integrate(this.edgeControlBends.get(id), this.edgeControlVelocities.get(id), edgeBendAccumulators.get(id),
-        this.pinned.has(id) || pinnedForStep.has(id), this.options);
-    }
-    this.syncEdgeControlWorldPositions();
-
-    this.tick += 1;
-    return this.snapshot({ intentCount });
-  }
-
-  run(steps = 1, options = {}) {
-    let result = this.snapshot();
-    for (let index = 0; index < steps; index += 1) {
-      result = this.step(options);
-    }
-    return result;
-  }
-
-  snapshot({ intentCount = 0 } = {}) {
-    const edgeControlIdSet = new Set(this.edgeControlIds);
-    const nodeIdSet = new Set(this.nodeIds);
-    return {
-      format: FORCE_LAYOUT_STEP_FORMAT,
-      version: FORCE_LAYOUT_STEP_VERSION,
-      gologId: this.graph.gologId,
-      tick: this.tick,
-      forceField: {
-        format: this.forceField?.format ?? null,
-        sourceCount: this.forceField?.sourceCount ?? 0,
-        statistics: { ...(this.forceField?.statistics ?? {}) },
-      },
-      forceTotals: this.vertexIds.map((id) => ({
-        id,
-        force: (this.lastForceTotals.get(id) ?? new THREE.Vector3()).clone(),
-      })),
-      positions: this.vertexIds
-        .filter((id) => nodeIdSet.has(id))
-        .map((id) => ({
-          id,
-          position: this.positions.get(id).clone(),
-        })),
-      edgeControls: this.vertexIds
-        .filter((id) => edgeControlIdSet.has(id))
-        .map((id) => ({
-          id,
-          midpoint: this.positions.get(id).clone(),
-          bend: this.edgeControlBends.get(id)?.clone?.() ?? new THREE.Vector2(),
-        })),
-      intentCount,
-    };
-  }
+  snapshot() { return layoutResult(this.ledger, this.diagnostics(), this.lastForces); }
+  flush() { return this.snapshot(); }
+  dispose() { this.activeGroups.clear(); }
 }
 
-export function createForceLayoutSimulation(graph, options = {}) {
-  return new ForceLayoutSimulation(graph, options);
+export function createForceLayoutSimulation(ledger, options = {}) {
+  return new ForceLayoutSimulation(ledger, options);
 }

@@ -70,6 +70,13 @@ function positionTargetsFromOperation(operation = {}) {
     ];
   }
 
+  if (operation.type === "edge:move-midpoint" && payload.id && payload.midpoint) {
+    return [{ id: String(payload.id), coordinate: "midpoint", target: vector3FromValue(payload.midpoint) }];
+  }
+  if (operation.type === "surface:move-control" && payload.id && Number.isFinite(Number(payload.controlCoordinate))) {
+    return [{ id: String(payload.id), coordinate: "local", target: new THREE.Vector3(Number(payload.controlCoordinate), 0, 0) }];
+  }
+
   if (operation.type === "layout:commit") {
     return [
       ...(payload.positions ?? [])
@@ -86,6 +93,8 @@ function positionTargetsFromOperation(operation = {}) {
           coordinate: "midpoint",
           target: vector3FromValue(entry.midpoint),
         })),
+      ...(payload.surfaceControls ?? []).filter((entry) => entry?.id && Number.isFinite(Number(entry.controlCoordinate)))
+        .map((entry) => ({ id: String(entry.id), coordinate: "local", target: new THREE.Vector3(Number(entry.controlCoordinate), 0, 0) })),
     ];
   }
 
@@ -336,11 +345,12 @@ export class SemanticConvergenceService {
     this.refreshPositionTargets();
     const intents = [];
     for (const target of this.positionTargets.values()) {
-      if (!this.store?.spheres?.has(target.id)) {
+      if (!this.store?.getObject?.(target.id)) {
         continue;
       }
       intents.push({
         kind: "position",
+        coordinate: target.coordinate,
         id: target.id,
         target: target.target.clone(),
         strength: finiteNumber(target.strength, strength),

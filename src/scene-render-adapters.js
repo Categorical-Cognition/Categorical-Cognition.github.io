@@ -27,12 +27,19 @@ function renderScale(getRenderProfile, key) {
   return getRenderProfile?.()?.[key] ?? {};
 }
 
+function projectionSource(state, id) {
+  // Projectors copy their outputs. Read the replaced domain record directly
+  // instead of cloning it again before projection.
+  return state.objects ? state.objects.get(id) ?? null : state.getObject(id);
+}
+
 export class SphereRenderAdapter {
   constructor({ scene, state, getRenderProfile = emptyRenderProfile }) {
     this.scene = scene;
     this.state = state;
     this.getRenderProfile = getRenderProfile;
     this.meshes = new Map();
+    this.resourceVersion = 0;
   }
 
   add(id, position) {
@@ -64,6 +71,7 @@ export class SphereRenderAdapter {
     mesh.position.copy(projection.position);
     this.scene.add(mesh);
     this.meshes.set(projection.id, mesh);
+    this.resourceVersion++;
     mesh.updateMatrixWorld(true);
     this.updateSelection(projection.id);
     return mesh;
@@ -101,6 +109,7 @@ export class SphereRenderAdapter {
       disposeObject3D(mesh);
     }
     this.meshes.clear();
+    this.resourceVersion++;
   }
 }
 
@@ -110,6 +119,9 @@ export class LabelRenderAdapter {
     this.labels = new Map();
     this.visible = true;
     this.visibleIds = null;
+    this.orderPositions = new Map();
+    this.orderCamera = new THREE.Vector3(NaN, NaN, NaN);
+    this.resourceVersion = 0;
   }
 
   labelShouldBeVisible(label) {
@@ -138,6 +150,7 @@ export class LabelRenderAdapter {
     }
 
     updateLabelSprite(label, projection.text, projection.size);
+    this.resourceVersion++;
     positionLabelSprite(label, projection.anchor);
     this.applyLabelVisibility(label);
   }
@@ -151,6 +164,7 @@ export class LabelRenderAdapter {
     this.applyLabelVisibility(label);
     this.scene.add(label);
     this.labels.set(projection.id, label);
+    this.resourceVersion++;
   }
 
   remove(id) {
@@ -161,6 +175,7 @@ export class LabelRenderAdapter {
     this.scene.remove(label);
     disposeLabelSprite(label);
     this.labels.delete(id);
+    this.resourceVersion++;
   }
 
   setVisible(visible) {
@@ -171,7 +186,10 @@ export class LabelRenderAdapter {
   }
 
   setVisibleIds(ids = null) {
-    this.visibleIds = ids ? new Set(ids) : null;
+    const next = ids ? new Set(ids) : null;
+    if (next === this.visibleIds || (next && this.visibleIds && next.size === this.visibleIds.size
+      && [...next].every((id) => this.visibleIds.has(id)))) return;
+    this.visibleIds = next;
     for (const label of this.labels.values()) {
       this.applyLabelVisibility(label);
     }
@@ -180,26 +198,28 @@ export class LabelRenderAdapter {
   updateRenderOrder(cameraPosition) {
     const labelPosition = new THREE.Vector3();
     const labels = [...this.labels.values()].filter((label) => label.visible);
-    labels.sort(
-      (first, second) => {
-        const firstDistance = first
-          .getWorldPosition(labelPosition)
-          .distanceToSquared(cameraPosition);
-        const secondDistance = second
-          .getWorldPosition(labelPosition)
-          .distanceToSquared(cameraPosition);
-        return secondDistance - firstDistance;
-      },
-    );
-    labels.forEach((label, index) => {
-      label.renderOrder = LABEL_RENDER_ORDER_BASE + index;
-    });
+    let changed = !this.orderCamera.equals(cameraPosition) || labels.length !== this.orderPositions.size;
+    const distances = new Map();
+    for (const label of labels) {
+      label.getWorldPosition(labelPosition);
+      const previous = this.orderPositions.get(label);
+      if (!previous?.equals(labelPosition)) changed = true;
+      distances.set(label, labelPosition.distanceToSquared(cameraPosition));
+      if (previous) previous.copy(labelPosition);
+      else this.orderPositions.set(label, labelPosition.clone());
+    }
+    if (!changed) return;
+    this.orderCamera.copy(cameraPosition);
+    for (const label of this.orderPositions.keys()) if (!distances.has(label)) this.orderPositions.delete(label);
+    labels.sort((first, second) => distances.get(second) - distances.get(first));
+    labels.forEach((label, index) => { label.renderOrder = LABEL_RENDER_ORDER_BASE + index; });
   }
 
   dispose() {
     for (const id of [...this.labels.keys()]) {
       this.remove(id);
     }
+    this.orderPositions.clear();
   }
 }
 
@@ -296,17 +316,9 @@ export class EdgeRenderAdapter {
     this.update(id);
   }
 
-  updateConnectedToSphere(sphereId) {
-    for (const edge of this.graphics.values()) {
-      if (edge.sourceId === sphereId || edge.targetId === sphereId) {
-        this.update(edge.id);
-      }
-    }
-  }
-
   update(edgeId) {
     const edge = this.graphics.get(edgeId);
-    const projection = projectEdgeBatchRecord(this.state.getObject(edgeId), {
+    const projection = projectEdgeBatchRecord(projectionSource(this.state, edgeId), {
       renderScale: renderScale(this.getRenderProfile, "edge"),
     });
     if (!edge || !projection) {
@@ -373,7 +385,7 @@ export class EdgeRenderAdapter {
 
   projectHandle(edgeId) {
     return projectEdgeHandleMesh(
-      this.state.getObject(this.state.edgeBendHandleId(edgeId)),
+      projectionSource(this.state, this.state.edgeBendHandleId(edgeId)),
       {
         renderScale: renderScale(this.getRenderProfile, "edgeHandle"),
       },
@@ -428,7 +440,7 @@ export class SurfaceRenderAdapter {
       return null;
     }
 
-    const geometry = new THREE.SphereGeometry(projection.radius, 18, 12);
+    const geometry = createSurfaceControlGeometry(projection);
     const material = new THREE.MeshStandardMaterial({
       color: projection.color,
       roughness: 0.42,
@@ -480,7 +492,7 @@ export class SurfaceRenderAdapter {
       surface.frameId = payload.frameId;
     }
 
-    const record = this.state.getObject(surfaceId);
+    const record = projectionSource(this.state, surfaceId);
     const batchRecords = projectSurfaceBatchRecords(record);
     if (!record || batchRecords.length === 0) {
       return;
@@ -496,8 +508,21 @@ export class SurfaceRenderAdapter {
       this.batchRenderer.upsertSurface(batchRecord);
     }
     surface.batchIds = [...nextBatchIds];
-    surface.control.position.copy(record.controlPoint);
-    surface.controlPick.position.copy(record.controlPoint);
+    const projection = this.projectControl(surfaceId, record);
+    if (!projection) return;
+    const geometryType = projection.direction ? "ConeGeometry" : "SphereGeometry";
+    if (surface.control.geometry.type !== geometryType) {
+      surface.control.geometry.dispose();
+      surface.control.geometry = createSurfaceControlGeometry(projection);
+    }
+    surface.control.quaternion.identity();
+    if (projection.direction) {
+      surface.control.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0, 1, 0), projection.direction,
+      );
+    }
+    surface.control.position.copy(projection.position);
+    surface.controlPick.position.copy(projection.position);
     surface.control.updateMatrixWorld(true);
     surface.controlPick.updateMatrixWorld(true);
   }
@@ -548,10 +573,11 @@ export class SurfaceRenderAdapter {
     return this.graphics.get(surfaceId) ?? null;
   }
 
-  projectControl(surfaceId) {
+  projectControl(surfaceId, surface = projectionSource(this.state, surfaceId)) {
     return projectSurfaceControlMesh(
-      this.state.getObject(this.state.surfaceControlHandleId(surfaceId)),
+      projectionSource(this.state, this.state.surfaceControlHandleId(surfaceId)),
       {
+        surface,
         renderScale: renderScale(this.getRenderProfile, "surfaceControl"),
       },
     );
@@ -571,13 +597,25 @@ export class VolumeRenderAdapter {
     this.graphics = this.renderer.graphics;
     this.diagnostics = this.renderer.diagnostics;
     this.projectionSignatures = new Map();
+    this.projectionSources = new Map();
   }
 
   add(volume) { return this.update(volume.id); }
 
   update(id) {
-    const projection = projectVolumeRecord(this.state.getObject(id), {
-      getObject: (faceId) => this.state.getObject(faceId),
+    // Domain object records are replaced on upsert. Duplicate notifications can
+    // reuse their projection without cloning every boundary control net again.
+    if (this.state.objects) {
+      const record = this.state.objects.get(id);
+      const sources = [record, ...(record?.boundaryFaceIds ?? []).map((faceId) => this.state.objects.get(faceId))];
+      const previous = this.projectionSources.get(id);
+      if (previous?.length === sources.length && sources.every((source, index) => source === previous[index])) {
+        return this.graphics.get(id) ?? null;
+      }
+      this.projectionSources.set(id, sources);
+    }
+    const projection = projectVolumeRecord(projectionSource(this.state, id), {
+      getObject: (faceId) => projectionSource(this.state, faceId),
     });
     if (!projection) return this.remove(id);
     const signature = JSON.stringify(projection);
@@ -587,21 +625,27 @@ export class VolumeRenderAdapter {
   }
 
   updateDependingOn(faceId) {
-    for (const volume of this.state.volumes?.values() ?? []) {
-      if (volume.boundaryFaceIds?.includes(faceId)) this.update(volume.id);
-    }
+    for (const volume of this.state.volumesForSurface(faceId)) this.update(volume.id);
   }
 
   updateSelection(id) { this.renderer.updateSelection(id); }
   controls() { return this.renderer.pickMeshes(); }
   remove(id) {
     this.projectionSignatures.delete(id);
+    this.projectionSources.delete(id);
     return this.renderer.remove(id);
   }
   dispose() {
     this.projectionSignatures.clear();
+    this.projectionSources.clear();
     this.renderer.dispose();
   }
+}
+
+function createSurfaceControlGeometry(projection) {
+  return projection.direction
+    ? new THREE.ConeGeometry(projection.radius, projection.height, 24)
+    : new THREE.SphereGeometry(projection.radius, 18, 12);
 }
 
 function alignConeToEdge(cone, start, end) {

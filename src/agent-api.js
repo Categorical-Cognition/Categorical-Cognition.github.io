@@ -2417,11 +2417,15 @@ function runForceLayoutForAgents(app, request = {}) {
   const operation = request.commit
     ? controller.commit(result, { layoutId: request.layoutId ?? "agent-force-layout" })
     : null;
+  controller.dispose();
   return {
     format: GOLOG_AGENT_API_FORMAT,
     version: GOLOG_AGENT_API_VERSION,
     gologId: golog.id,
     tick: result.tick,
+    diagnostics: result.diagnostics,
+    edgeControls: result.edgeControls.map((entry) => ({ ...entry, bend: entry.bend.toArray(), midpoint: entry.midpoint.toArray() })),
+    surfaceControls: result.surfaceControls,
     committedOperationId: operation?.id ?? null,
     positions: result.positions.map((entry) => ({
       id: entry.id,
@@ -2450,7 +2454,7 @@ function inspectPresheafForAgents(workspace, request = {}) {
 
 export function createGologAgentApi(app) {
   const workspace = app.workspace;
-  return {
+  const api = {
     format: GOLOG_AGENT_API_FORMAT,
     version: GOLOG_AGENT_API_VERSION,
     exportWorkspace: (options = {}) =>
@@ -2553,4 +2557,11 @@ export function createGologAgentApi(app) {
       return { ok: Boolean(transaction), transaction };
     },
   };
+  // Semantic reads and edits are explicit barriers for resident layout state.
+  return Object.fromEntries(Object.entries(api).map(([key, value]) => [key,
+    typeof value === "function" ? (...args) => {
+      app.flushLayout?.();
+      return value(...args);
+    } : value,
+  ]));
 }

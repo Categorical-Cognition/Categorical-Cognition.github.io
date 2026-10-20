@@ -132,11 +132,14 @@ export class EdgeBatchRenderer extends BatchedGeometryRenderer {
   }
 
   upsertEdge(edge) {
+    this.renderVersion = (this.renderVersion ?? 0) + 1;
+    if (!this.records.has(edge.id)) this.topologyVersion = (this.topologyVersion ?? 0) + 1;
     const record = cloneEdgeRecord(edge);
     this.upsertRecord(record.id, record);
   }
 
   removeEdge(id) {
+    if (this.records.has(id)) this.topologyVersion = (this.topologyVersion ?? 0) + 1;
     this.removeRecord(id);
   }
 
@@ -243,34 +246,27 @@ export class EdgeBatchRenderer extends BatchedGeometryRenderer {
       const current = samples[sampleIndex];
       const next = samples[Math.min(this.sampleCount - 1, sampleIndex + 1)];
 
-      this.writeSampleVertex({
-        slot,
-        sampleIndex,
-        sideIndex: 0,
-        side: -1,
-        current,
-        previous,
-        next,
-        color: [red, green, blue],
-        opacity,
-        thickness,
-        marker,
-        curveParameter: sampleIndex / this.samples,
-      });
-      this.writeSampleVertex({
-        slot,
-        sampleIndex,
-        sideIndex: 1,
-        side: 1,
-        current,
-        previous,
-        next,
-        color: [red, green, blue],
-        opacity,
-        thickness,
-        marker,
-        curveParameter: sampleIndex / this.samples,
-      });
+      for (let sideIndex = 0; sideIndex < 2; sideIndex++) {
+        const vertex = slot * this.verticesPerEdge + sampleIndex * 2 + sideIndex;
+        const offset = vertex * 3;
+        this.positions[offset] = current.x;
+        this.positions[offset + 1] = current.y;
+        this.positions[offset + 2] = current.z;
+        this.previousPositions[offset] = previous.x;
+        this.previousPositions[offset + 1] = previous.y;
+        this.previousPositions[offset + 2] = previous.z;
+        this.nextPositions[offset] = next.x;
+        this.nextPositions[offset + 1] = next.y;
+        this.nextPositions[offset + 2] = next.z;
+        this.colors[offset] = red;
+        this.colors[offset + 1] = green;
+        this.colors[offset + 2] = blue;
+        this.sides[vertex] = sideIndex * 2 - 1;
+        this.opacities[vertex] = opacity;
+        this.thicknesses[vertex] = thickness;
+        this.markers[vertex] = marker;
+        this.curveParameters[vertex] = sampleIndex / this.samples;
+      }
     }
 
     this.markSlotAttributesDirty(slot);
@@ -281,34 +277,6 @@ export class EdgeBatchRenderer extends BatchedGeometryRenderer {
       edge.control ?? getQuadraticControlPoint(edge.start, edge.midpoint, edge.end);
     const curve = new THREE.QuadraticBezierCurve3(edge.start, control, edge.end);
     return curve.getPoints(this.samples);
-  }
-
-  writeSampleVertex({
-    slot,
-    sampleIndex,
-    sideIndex,
-    side,
-    current,
-    previous,
-    next,
-    color,
-    opacity,
-    thickness,
-    marker,
-    curveParameter,
-  }) {
-    const vertexIndex = slot * this.verticesPerEdge + sampleIndex * 2 + sideIndex;
-    const vectorOffset = vertexIndex * 3;
-
-    this.positions.set(current.toArray(), vectorOffset);
-    this.previousPositions.set(previous.toArray(), vectorOffset);
-    this.nextPositions.set(next.toArray(), vectorOffset);
-    this.sides[vertexIndex] = side;
-    this.colors.set(color, vectorOffset);
-    this.opacities[vertexIndex] = opacity;
-    this.thicknesses[vertexIndex] = thickness;
-    this.markers[vertexIndex] = marker;
-    this.curveParameters[vertexIndex] = curveParameter;
   }
 
   writeIndicesForSlot(slot) {

@@ -336,43 +336,31 @@
           <section id="force-controls" class="force-controls" aria-label="Force tuning">
             <header>Forces</header>
             <label>
-              <span>Node gravity <output data-force-value="gravity">0.020</output></span>
-              <input data-force-setting="gravity" type="range" min="0" max="0.05" step="0.001" />
+              <span>Control restoring force <output data-force-value="restoringStrength">0.035</output></span>
+              <input data-force-setting="restoringStrength" type="range" min="0" max="0.2" step="0.001" />
             </label>
             <label>
-              <span>Node repulsion <output data-force-value="repulsion">8.000</output></span>
-              <input data-force-setting="repulsion" type="range" min="0" max="20" step="0.1" />
+              <span>Cobounded repulsion <output data-force-value="peerRepulsionStrength">0.040</output></span>
+              <input data-force-setting="peerRepulsionStrength" type="range" min="0" max="0.2" step="0.002" />
             </label>
             <label>
-              <span>Edge pull <output data-force-value="edgePull">0.080</output></span>
-              <input data-force-setting="edgePull" type="range" min="0" max="0.2" step="0.002" />
+              <span>Boundary separation <output data-force-value="boundaryRepulsionStrength">0.008</output></span>
+              <input data-force-setting="boundaryRepulsionStrength" type="range" min="0" max="0.1" step="0.001" />
             </label>
             <label>
-              <span>Edge plane <output data-force-value="edgePlaneGravity">0.035</output></span>
-              <input data-force-setting="edgePlaneGravity" type="range" min="0" max="0.2" step="0.002" />
+              <span>Edge tension <output data-force-value="edgeSpringStrength">0.080</output></span>
+              <input data-force-setting="edgeSpringStrength" type="range" min="0" max="0.2" step="0.002" />
             </label>
             <label>
-              <span>Plane repulsion <output data-force-value="samePlaneEdgeRepulsion">0.018</output></span>
-              <input data-force-setting="samePlaneEdgeRepulsion" type="range" min="0" max="0.2" step="0.002" />
+              <span>Preferred edge length <output data-force-value="restLength">2.400</output></span>
+              <input data-force-setting="restLength" type="range" min="0.1" max="8" step="0.1" />
             </label>
             <label>
-              <span>Opposite arrows <output data-force-value="oppositeArrowEdgeRepulsion">0.028</output></span>
-              <input data-force-setting="oppositeArrowEdgeRepulsion" type="range" min="0" max="0.2" step="0.002" />
+              <span>Minimum triangle height <output data-force-value="minAltitude">0.800</output></span>
+              <input data-force-setting="minAltitude" type="range" min="0" max="4" step="0.05" />
             </label>
             <label>
-              <span>2-simplex nodes <output data-force-value="twoSimplexNodeBarycenter">0.001</output></span>
-              <input data-force-setting="twoSimplexNodeBarycenter" type="range" min="0" max="0.05" step="0.0005" />
-            </label>
-            <label>
-              <span>2-simplex edges <output data-force-value="twoSimplexEdgeBarycenter">0.002</output></span>
-              <input data-force-setting="twoSimplexEdgeBarycenter" type="range" min="0" max="0.05" step="0.0005" />
-            </label>
-            <label>
-              <span>2-face factor <output data-force-value="twoSimplexFaceTightening">1.80</output></span>
-              <input data-force-setting="twoSimplexFaceTightening" type="range" min="1" max="4" step="0.05" />
-            </label>
-            <label>
-              <span>Global coherence <output data-force-value="globalCoherence">0.080</output></span>
+              <span>Shared position agreement <output data-force-value="globalCoherence">0.080</output></span>
               <input data-force-setting="globalCoherence" type="range" min="0" max="1" step="0.01" />
             </label>
           </section>

@@ -6,6 +6,7 @@ import {
   SURFACE_RENDER_SPEC,
 } from "./domain-object-definitions.js";
 import { cloneStoreValue } from "./store-utils.js";
+import { createTwoCellFaceDirection } from "./surface-geometry-service.js";
 
 function scaledNumber(value, scale) {
   return typeof value === "number" && typeof scale === "number"
@@ -98,21 +99,38 @@ export function projectEdgeHandleMesh(record, { renderScale = {} } = {}) {
   };
 }
 
-export function projectSurfaceControlMesh(record, { renderScale = {} } = {}) {
+export function projectSurfaceControlMesh(
+  record,
+  { surface = null, renderScale = {} } = {},
+) {
   if (!record || record.kind !== "surface-control-handle") {
     return null;
   }
 
-  const render = renderWithDefaults(
-    record,
-    SURFACE_CONTROL_HANDLE_RENDER_SPEC,
-    renderScale,
-  );
+  const direction = surface?.surfaceType === "two-cell"
+    ? createTwoCellFaceDirection(surface)
+    : null;
+  const render = {
+    ...renderWithDefaults(
+      record,
+      SURFACE_CONTROL_HANDLE_RENDER_SPEC,
+      renderScale,
+    ),
+    geometry: direction ? "cone" : "sphere",
+    height: direction
+      ? scaledNumber(
+        record.render?.height ?? 0.28,
+        renderScale.height ?? renderScale.radius,
+      )
+      : undefined,
+  };
   return {
     id: record.id,
     surfaceId: record.surfaceId,
     name: `${record.surfaceId}-surface-control`,
     radius: render.radius,
+    height: render.height,
+    direction,
     color: render.color,
     selectedColor: render.selectedColor,
     pickRadius: render.pickRadius,
@@ -179,6 +197,7 @@ export function projectSurfaceBatchRecords(record) {
   return record.patchControlNets.map((controlNet, index) => ({
     id: `${record.id}:patch:${index + 1}`,
     ownerId: record.id,
+    patchIndex: index,
     controlNet: cloneStoreValue(controlNet),
     render,
   }));
@@ -191,6 +210,17 @@ export function projectVolumeRecord(record, { getObject } = {}) {
   const boundarySurfaces = boundaryFaceIds.map((faceId) => {
     const face = getObject?.(faceId);
     const patches = face ? projectSurfaceBatchRecords(face) : [];
+    const edges = face?.edgeIds;
+    const edge = (id, reverse = false) => ({ id, start: Number(reverse), end: Number(!reverse) });
+    let boundary;
+    if (face?.triangleControlNet && face.nodeIds?.length === 3 && edges?.length === 3) {
+      boundary = { corners: [...face.nodeIds],
+        edges: [edge(edges[0]), edge(edges[1]), edge(edges[2], true)] };
+    } else if (face?.surfaceType === "two-cell" && face.sourceId && face.targetId && edges?.length === 2) {
+      boundary = { corners: [face.sourceId, face.targetId, face.targetId, face.sourceId],
+        edges: [edge(edges[0]), null, edge(edges[1], true), null] };
+    }
+    if (boundary && patches.length === 1) patches[0].boundary = boundary;
     if (!patches.length) missingFaceIds.push(faceId);
     return { faceId, patches };
   });
@@ -201,7 +231,7 @@ export function projectVolumeRecord(record, { getObject } = {}) {
     boundaryFaceIds,
     boundarySurfaces,
     missingFaceIds,
-    origin: record.origin?.clone() ?? record.label?.anchor?.clone() ?? null,
+    origin: record.label?.anchor?.clone() ?? record.origin?.clone() ?? null,
     render: {
       color: 0xe9b963,
       selectedColor: 0xffed95,

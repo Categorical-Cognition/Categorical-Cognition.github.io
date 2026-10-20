@@ -1,10 +1,15 @@
 import * as THREE from "three";
+import { inferSurfaceBoundarySelection } from "./surface-boundary-selection.js";
+import { inferWhiskeringBoundary } from "./whiskering-boundary-inference.js";
 import { appendPdfPreview, safePayloadPreviewUrl } from "./payload-preview.js";
 import {
   makePlaneBasisFromNormal as calculatePlaneBasisFromNormal,
 } from "./geometry-utils.js";
 import { EdgeBatchRenderer } from "./edge-batch-renderer.js";
 import { SurfaceBatchRenderer } from "./surface-batch-renderer.js";
+import { LayoutRenderAdapter } from "./layout-render-adapter.js";
+import { LayoutPicker } from "./layout-picking.js";
+import { createDomainOperation } from "./domain-operations.js";
 import {
   EdgeRenderAdapter,
   LabelRenderAdapter,
@@ -247,6 +252,8 @@ export class GologScene {
     this.edgeGraphics = this.edgeRenderer.graphics;
     this.surfaceGraphics = this.surfaceRenderer.graphics;
     this.volumeGraphics = this.volumeRenderer.graphics;
+    this.layoutRenderAdapter = new LayoutRenderAdapter(this);
+    this.previewLayoutSolvers = new Map();
 
     this.bus.on("render:sphere-created", ({ id, position }) => {
       this.sphereRenderer.add(id, position);
@@ -261,20 +268,16 @@ export class GologScene {
     this.bus.on("render:sphere-moved", ({ id, position }) =>
       this.moveSphereMesh(id, position),
     );
-    this.bus.on("render:sphere-moved", ({ id }) =>
-      {
-        this.edgeRenderer.updateConnectedToSphere(id);
-
-      },
-    );
     this.bus.on("store:object-upserted", (record) => {
       this.labelRenderer.sync(record);
       if (record.kind === "volume") this.volumeRenderer.update(record.id);
-      else this.volumeRenderer.updateDependingOn(record.id);
-      this.updateNestedPreviewTransform();
+      this.updateNestedPreviewTransform(record.id);
       this.updateModeLabelFilter();
     });
     this.bus.on("store:object-deleted", (record) => {
+      if (this.selectionBuffer.some((entry) => entry.id === record.id)) {
+        this.rememberSelection(null);
+      }
       if (this.nestedPreviews.has(record.id)) {
         this.closeNestedGologPreview(record.id);
       }
@@ -289,7 +292,6 @@ export class GologScene {
       }
       this.labelRenderer.remove(record.id);
       if (record.kind === "volume") this.volumeRenderer.remove(record.id);
-      else this.volumeRenderer.updateDependingOn(record.id);
       this.updateModeLabelFilter();
     });
     this.bus.on("render:edge-created", (edge) => {
@@ -388,6 +390,7 @@ export class GologScene {
     this.renderer.domElement.style.display = active ? "block" : "none";
     this.renderer.domElement.classList.toggle("golog-scene-hidden", !active);
     if (!active) {
+      this.rememberSelection(null);
       this.clearKeys();
       this.releaseDragAuthority(this.drag);
       this.drag = null;
@@ -434,6 +437,8 @@ export class GologScene {
     this.edgeRenderer?.dispose();
     this.surfaceRenderer?.dispose();
     this.volumeRenderer?.dispose();
+    this.layoutRenderAdapter?.dispose();
+    this.layoutPicker?.dispose();
     this.edgeBatchRenderer?.dispose();
     this.surfaceBatchRenderer?.dispose();
     this.renderer.domElement.remove();
@@ -734,7 +739,7 @@ export class GologScene {
     if (!position) {
       return null;
     }
-    const point = position.clone();
+    const point = this.residentAnchor(id) ?? position.clone();
     if (!this.gologContent) {
       return point;
     }
@@ -1007,6 +1012,7 @@ export class GologScene {
       sphere.visible = preview.previousSphereVisible;
     }
     preview.releaseChildListener?.();
+    preview.layoutRenderAdapter?.dispose();
     this.disposePreviewObject(preview.shell);
     this.disposePreviewObject(preview.content);
     this.scene.remove(preview.shell);
@@ -1313,6 +1319,8 @@ export class GologScene {
   }
 
   payloadBillboardAnchor(objectId, objectKind) {
+    const resident = this.residentAnchor(objectId);
+    if (resident) return resident;
     if (objectKind === "sphere") {
       return this.sphereMeshes.get(objectId)?.position?.clone() ?? null;
     }
@@ -1323,7 +1331,8 @@ export class GologScene {
       return this.surfaceGraphics.get(objectId)?.controlPoint?.clone() ?? null;
     }
     if (objectKind === "volume") {
-      return this.volumeGraphics.get(objectId)?.centroid?.clone() ??
+      return this.volumeGraphics.get(objectId)?.handle?.position?.clone() ??
+        this.state.getObject(objectId)?.label?.anchor?.clone() ??
         this.state.getObject(objectId)?.origin?.clone() ?? null;
     }
     return null;
@@ -1387,7 +1396,7 @@ export class GologScene {
       const sphere = this.sphereMeshes.get(objectId);
       sphere?.scale.setScalar(PAYLOAD_BILLBOARD_NODE_SCALE);
       if (record.pickMesh && sphere) {
-        record.pickMesh.position.copy(sphere.position);
+        record.pickMesh.position.copy(anchor);
         record.pickMesh.updateMatrixWorld(true);
       }
     }
@@ -1599,7 +1608,9 @@ export class GologScene {
     }
 
     const { content, childGolog } = preview;
-    this.nestedPreviewRenderer.rebuildContent(content, childGolog);
+    this.nestedPreviewRenderer.rebuildContent(content, childGolog, {
+      resident: Boolean(this.previewLayoutSolvers.get(childGolog?.id)),
+    });
   }
 
   pickSurfaceControlHits() {
@@ -1635,29 +1646,42 @@ export class GologScene {
     return 3;
   }
 
-  pickSelectable({ preferSphere = false } = {}) {
+  pickSelectable({ preferSphere = false, kind = null } = {}) {
+    if (this.residentInteraction()) {
+      this.layoutRenderAdapter.refresh();
+      this.layoutPicker ??= new LayoutPicker(this.renderer, this.layoutRenderAdapter);
+      const candidates = [
+        ...[...this.sphereMeshes].map(([id, object]) => ({ id, object, kind: "sphere" })),
+        ...[...this.surfaceGraphics].map(([id, surface]) => ({ id, object: surface.controlPick, kind: "surface" })),
+        ...[...this.edgeGraphics].map(([id, edge]) => ({ id, object: edge.conePick, kind: "edge" })),
+        ...[...this.volumeGraphics].map(([id, volume]) => ({ id, object: volume.handle, kind: "volume" })),
+      ].filter((candidate) => candidate.object && (!kind || candidate.kind === kind));
+      candidates.sort((a, b) => this.selectableSortPriority(b, preferSphere) - this.selectableSortPriority(a, preferSphere));
+      const selected = this.layoutPicker.pick(candidates, this.camera, this.pointer);
+      return selected && { ...selected, hit: { object: selected.object } };
+    }
     const candidates = [
-      ...this.pickSphereHits({ far: Infinity }).map((sphereHit) => ({
+      ...(!kind || kind === "sphere" ? this.pickSphereHits({ far: Infinity }) : []).map((sphereHit) => ({
         id: sphereHit.object.userData.sphereId,
         kind: "sphere",
         hit: sphereHit,
       })),
-      ...this.pickSurfaceControlHits().map((surfaceHit) => ({
+      ...(!kind || kind === "surface" ? this.pickSurfaceControlHits() : []).map((surfaceHit) => ({
         id: surfaceHit.object.userData.surfaceId,
         kind: "surface",
         hit: surfaceHit,
       })),
-      ...this.pickEdgeConeHits().map((edgeHit) => ({
+      ...(!kind || kind === "edge" ? this.pickEdgeConeHits() : []).map((edgeHit) => ({
         id: edgeHit.object.userData.edgeId,
         kind: "edge",
         hit: edgeHit,
       })),
-      ...this.pickVolumeControlHits().map((volumeHit) => ({
+      ...(!kind || kind === "volume" ? this.pickVolumeControlHits() : []).map((volumeHit) => ({
         id: volumeHit.object.userData.volumeId,
         kind: "volume",
         hit: volumeHit,
       })),
-    ].filter((candidate) => candidate.id);
+    ].filter((candidate) => candidate.id && (!kind || candidate.kind === kind));
 
     candidates.sort((left, right) => {
       const distanceDelta = left.hit.distance - right.hit.distance;
@@ -1729,6 +1753,7 @@ export class GologScene {
       return false;
     }
 
+    this.synchronizeForceLayout();
     const id = `two-simplex-${this.state.nextSurfaceId}`;
     this.bus.emit("element:create", {
       elementKind: ELEMENT_KINDS.TWO_SIMPLEX,
@@ -1787,19 +1812,139 @@ export class GologScene {
     return null;
   }
 
-  rememberSelection(selectable) {
+  isTwoCellSelectable(selectable) {
+    return selectable?.kind === "surface" &&
+      this.state.surfaces.get(selectable.id)?.elementKind === ELEMENT_KINDS.TWO_CELL;
+  }
+
+  isWhiskeringArrowSelection(selectable) {
+    return selectable?.kind === "edge" &&
+      (this.isTwoCellSelectable(this.selectionBuffer[0]) ||
+        (this.sameSelectable(selectable, this.selectionBuffer[0]) &&
+          this.isTwoCellSelectable(this.selectionBuffer[1])));
+  }
+
+  rememberSelection(selectable, { shiftKey = false } = {}) {
     const normalized = this.normalizeSelectable(selectable);
     if (!normalized) {
       this.selectionBuffer = [];
+      this.bus.emit("creation:boundary-status", { text: "" });
       return;
     }
 
+    const buffer = this.selectionBuffer;
+    let previous = null;
+    if (this.isWhiskeringArrowSelection(normalized)) {
+      previous = buffer[0].kind === "edge" ? buffer.slice(0, 2) : buffer.slice(0, 1);
+    } else if (normalized.kind === "surface") {
+      if (this.isTwoCellSelectable(normalized) && buffer[0]?.kind === "edge" &&
+          this.isTwoCellSelectable(buffer[1])) {
+        previous = buffer.slice(0, 2);
+      } else if (this.isTwoCellSelectable(normalized) && buffer[1]?.kind === "edge" &&
+          this.isTwoCellSelectable(buffer[2])) {
+        // Preserve the input and arrow while a rejected output is retried.
+        previous = buffer.slice(0, 3);
+        if (!this.sameSelectable(normalized, previous[0])) previous.shift();
+      } else {
+        previous = buffer.every((entry) => entry.kind === "surface") ? buffer : [];
+      }
+    }
+    if (previous) {
+      const existing = previous.find((entry) => this.sameSelectable(entry, normalized));
+      this.selectionBuffer = [
+        { ...normalized, shiftKey: shiftKey || Boolean(existing?.shiftKey) },
+        ...previous.filter((entry) => !this.sameSelectable(entry, normalized)),
+      ].slice(0, 5);
+      return;
+    }
+
+    this.bus.emit("creation:boundary-status", { text: "" });
     this.selectionBuffer = [
       normalized,
-      ...this.selectionBuffer.filter(
-        (entry) => !this.sameSelectable(entry, normalized),
-      ),
+      ...buffer.filter((entry) => !this.sameSelectable(entry, normalized))
+        .map(({ id, kind }) => ({ id, kind })),
     ].slice(0, 2);
+  }
+
+  handleBoundarySelection(selectable, event = {}) {
+    if (selectable?.kind !== "surface" && !this.isWhiskeringArrowSelection(selectable)) return false;
+    const selectionEvent = selectable.kind === "edge" ? "edge:select" : "surface:select";
+    if (this.modeHead?.usesVirtualDoubleCreation?.() ||
+        (this.modeHead && !this.modeHead.canCreateSurface())) {
+      this.rememberSelection(null);
+      this.bus.emit(selectionEvent, { id: selectable.id });
+      return true;
+    }
+    if (this.boundaryCreationPending) return true;
+    // Deleted boundary objects must not leave an old creation gesture armed.
+    if (this.selectionBuffer.some((entry) =>
+      (entry.kind === "surface" && !this.state.surfaces.has(entry.id)) ||
+      (entry.kind === "edge" && !this.state.edges.has(entry.id)))) this.rememberSelection(null);
+    this.rememberSelection(selectable, event);
+    const buffer = this.selectionBuffer;
+    if (!buffer.some((entry) => entry.shiftKey)) {
+      this.bus.emit(selectionEvent, { id: selectable.id });
+      return true;
+    }
+    const mixed = buffer.some((entry) => entry.kind === "edge");
+    const payload = mixed && buffer.length === 3
+      ? { inputId: buffer[2].id, edgeId: buffer[1].id, outputId: buffer[0].id } : null;
+    const inference = mixed
+      ? (payload ? inferWhiskeringBoundary(this.state.getPresheaf(), payload)
+        : { status: "incomplete" })
+      : inferSurfaceBoundarySelection(this.state.getPresheaf(), [...buffer].reverse());
+    if (inference.status === "matched") {
+      if (mixed) this.submitBoundaryOperation("whiskering:create", payload, buffer);
+      else this.submitSurfaceBoundary(inference.match, buffer);
+      return true;
+    }
+    this.bus.emit(selectionEvent, { id: selectable.id });
+    const detail = mixed
+      ? (inference.status === "incomplete"
+        ? "Select the composite 2-cell to complete whiskering."
+        : "These ordered 2-cells and arrow do not define a unique whiskering boundary.")
+      : inference.status === "ambiguous"
+        ? "Boundary has multiple bindings; use Region to choose the faces."
+        : inference.status === "invalid"
+          ? "These faces do not form a supported boundary."
+          : `${buffer.length} boundary face${buffer.length === 1 ? "" : "s"} selected; select the remaining faces.`;
+    this.bus.emit("creation:boundary-status", { text: `${detail} Escape clears the boundary selection.` });
+    return true;
+  }
+
+  submitSurfaceBoundary(match, buffer) {
+    return this.submitBoundaryOperation("element:create", {
+      elementKind: "theta-volume", shapeId: match.shapeId, faces: match.faces,
+    }, buffer);
+  }
+
+  async submitBoundaryOperation(type, payload, buffer) {
+    this.boundaryCreationPending = true;
+    this.bus.emit("creation:boundary-status", { text: "Creating region…" });
+    const retryTarget = type === "whiskering:create" ? "the composite 2-cell" : "a boundary face";
+    try {
+      this.synchronizeForceLayout();
+      const origin = (typeof this.state.operationOrigin === "function"
+        ? this.state.operationOrigin(type, payload) : this.state.operationOrigin)
+        ?? { source: "human-interface", role: "author" };
+      const result = await this.state.operationPipeline.submit(type, payload, { origin });
+      if (this.selectionBuffer !== buffer || this.disposed) return;
+      if (result.pending) {
+        // A relay proposal has already been sent. Consume the gesture so a
+        // later plain click cannot resubmit it before authoritative replay.
+        this.rememberSelection(null);
+        this.bus.emit("creation:boundary-status", { text: "Boundary submitted to the shared workspace." });
+      } else if (result.ok) this.rememberSelection(null);
+      else this.bus.emit("creation:boundary-status", { text:
+        `Region creation was not accepted. Check edit access, then select ${retryTarget} to retry or press Escape.` });
+    } catch {
+      if (this.selectionBuffer === buffer && !this.disposed) {
+        this.bus.emit("creation:boundary-status", { text:
+          `Region creation failed. Check the boundary, then select ${retryTarget} to retry or press Escape.` });
+      }
+    } finally {
+      this.boundaryCreationPending = false;
+    }
   }
 
   selectSelectable(selectable) {
@@ -1883,6 +2028,7 @@ export class GologScene {
       return false;
     }
 
+    this.synchronizeForceLayout();
     action.create(source, target, event);
     return true;
   }
@@ -1937,12 +2083,14 @@ export class GologScene {
   }
 
   handleShiftSelectable(selectable, event = null) {
+    if (this.handleBoundarySelection(selectable, { ...event, shiftKey: true })) return;
     if (!selectable) {
       if (this.modeHead && !this.modeHead.canCreateNode(this.state.gologId)) {
         return;
       }
       const position = this.intersectSelectionSphere();
       if (position) {
+        this.synchronizeForceLayout();
         const id = `sphere-${this.state.nextSphereId}`;
         this.bus.emit("element:create", {
           elementKind:
@@ -2140,29 +2288,7 @@ export class GologScene {
   }
 
   pickSelectableOfKind(kind) {
-    if (kind === "sphere") {
-      const hit = this.pickSphereHits({ far: Infinity })[0];
-      return hit?.object?.userData?.sphereId
-        ? { id: hit.object.userData.sphereId, kind: "sphere", hit }
-        : null;
-    }
-    if (kind === "edge") {
-      const hit = this.pickEdgeCone();
-      return hit?.object?.userData?.edgeId
-        ? { id: hit.object.userData.edgeId, kind: "edge", hit }
-        : null;
-    }
-    if (kind === "surface") {
-      const hit = this.pickSurfaceControl();
-      return hit?.object?.userData?.surfaceId
-        ? { id: hit.object.userData.surfaceId, kind: "surface", hit }
-        : null;
-    }
-    if (kind === "volume") {
-      const hit = this.pickVolumeControlHits()[0];
-      return hit ? { id: hit.object.userData.volumeId, kind, hit } : null;
-    }
-    return null;
+    return this.pickSelectable({ kind });
   }
 
   pickIphoneCreationSelectable(drag = this.iphoneCreationDrag) {
@@ -2411,6 +2537,23 @@ export class GologScene {
 
     if (selectable && this.modeHead && !this.modeHead.canDragObject()) {
       return null;
+    }
+    if (selectable && this.residentInteraction()) {
+      const handle = this.forceLayoutController.readHandle(selectable.id);
+      if (!handle?.dof) return null;
+      const point = new THREE.Vector3().fromArray(handle.position);
+      const frame = handle.frame, basis = frame.basis.map((axis) => new THREE.Vector3().fromArray(axis));
+      let drag;
+      if (handle.dof === 1) {
+        drag = this.makeSurfaceControlDrag({ controlPoint: point, controlDirection: basis[0],
+          controlCoordinate: handle.coordinates[0] }, event);
+      } else if (handle.dof === 2) {
+        drag = this.makeEdgeMidpointDrag({ midpoint: point }, event, basis[0].clone().cross(basis[1]).normalize());
+      } else {
+        drag = this.makeSphereDrag({ object: { position: point } });
+      }
+      return drag ? { kind: selectable.kind, id: selectable.id,
+        drag: { ...drag, resident: true, initialHandle: handle } } : null;
     }
     if (selectable?.kind === "surface") {
       const controlDrag = this.makeSurfaceControlDrag(
@@ -2698,7 +2841,7 @@ export class GologScene {
     return claim;
   }
 
-  releaseDragAuthority(drag = null) {
+  releaseDragAuthority(drag = null, { retiring = false, solver } = {}) {
     if (!drag) {
       return;
     }
@@ -2712,8 +2855,23 @@ export class GologScene {
       }
       this.state.endInteractionControl?.(drag.interactionClaim);
     }
-    if (drag.lockIds) {
-      this.state.releaseLocks(drag.lockIds, this.client);
+    const executor = retiring
+      ? (solver === undefined ? this.forceLayoutController?.simulation : solver)
+      : this.forceLayoutController;
+    const id = drag.id ?? drag.edgeId ?? drag.surfaceId;
+    let snapshot = null;
+    try {
+      if (drag.resident && executor && !executor.disposed) {
+        const handle = executor.readHandle(id);
+        if (handle) snapshot = this.handlePatchSnapshot(handle);
+      }
+    } finally {
+      try {
+        if (drag.resident) this.state.workspace?.patchHistory?.endInteraction(this.state, id, snapshot);
+      } finally {
+        try { if (drag.resident && executor && !executor.disposed) executor.releaseHandle(id); }
+        finally { if (drag.lockIds) this.state.releaseLocks(drag.lockIds, this.client); }
+      }
     }
   }
 
@@ -2756,6 +2914,15 @@ export class GologScene {
       return false;
     }
     const interactionClaim = this.beginDragAuthority(staged);
+    if (staged.drag?.resident && !interactionClaim.ok) {
+      this.releaseDragAuthority({ lockIds: lock.lockIds, interactionClaim });
+      return false;
+    }
+    if (staged.drag?.resident) {
+      this.state.workspace?.patchHistory?.beginInteraction(
+        this.state, staged.id, this.handlePatchSnapshot(staged.drag.initialHandle),
+      );
+    }
 
     if (staged.kind === "surface") {
       this.drag = {
@@ -2794,7 +2961,12 @@ export class GologScene {
       return;
     }
     this.syncModifierKeysFromPointer(event);
-    this.setPointerFromEvent(event);
+    const staged = this.pendingPointer?.stagedDrag;
+    const coordinateDrag = this.drag && !this.drag.cameraOrbit && !this.drag.cameraLook;
+    const startingCoordinateDrag = staged && !staged.kind.startsWith("camera-")
+      && this.pointerMovedPastClickThreshold(event, this.pendingPointer);
+    this.setPointerFromEvent(event, { synchronize: !this.residentInteraction()
+      && Boolean(this.iphoneCreationDrag || coordinateDrag || startingCoordinateDrag) });
     if (this.updateIphoneTouchGesture(event)) {
       return;
     }
@@ -2828,6 +3000,33 @@ export class GologScene {
 
     if (this.drag.cameraLook) {
       this.updateCameraLookDrag();
+      return;
+    }
+    if (this.drag.resident) {
+      const id = this.drag.id ?? this.drag.edgeId ?? this.drag.surfaceId;
+      const operation = this.drag.surfaceId ? "surface:move-control"
+        : this.drag.edgeId ? "edge:move-midpoint" : "sphere:move";
+      if (!this.state.canMutateObjects(this.state.getLockScopeForObject(id), this.client, operation)) return;
+      let point;
+      if (this.drag.surfaceId) {
+        const coordinate = this.surfaceControlCoordinateFromRay(this.drag);
+        if (coordinate === null) return;
+        point = this.drag.lineOrigin.clone().addScaledVector(this.drag.lineDirection,
+          this.drag.controlCoordinate + coordinate - this.drag.rayCoordinate);
+      } else if (this.drag.edgeId) point = this.edgeMidpointFromRay(this.drag);
+      else point = this.intersectSphereDragPlane(this.drag)?.sub(this.drag.offset);
+      if (point) {
+        const payload = { id, clientId: this.client.id, clientIp: this.client.ip,
+          interaction: { mode: "drag", token: this.drag.interactionClaim?.token ?? null },
+          ...(this.drag.surfaceId ? { controlCoordinate: this.drag.controlCoordinate
+            + this.surfaceControlCoordinateFromRay(this.drag) - this.drag.rayCoordinate }
+            : this.drag.edgeId ? { midpoint: point } : { position: point }) };
+        const mutation = createDomainOperation(this.state, operation, payload,
+          { origin: this.drag.interactionClaim?.claimant ?? this.interactionOrigin(id) });
+        if (this.state.mutationPolicy.evaluate(mutation, { emit: false }).ok) {
+          this.forceLayoutController.moveHandle(id, point.toArray());
+        }
+      }
       return;
     }
 
@@ -2924,7 +3123,9 @@ export class GologScene {
           ) {
             return;
           }
-          this.selectSelectable(selectable);
+          if (!this.handleBoundarySelection(selectable, event)) {
+            this.selectSelectable(selectable);
+          }
         }
       }
     }
@@ -3044,6 +3245,12 @@ export class GologScene {
     if (this.isEditableEventTarget(event.target)) {
       return;
     }
+    if (event.key === "Escape" && this.selectionBuffer?.some((entry) => entry.kind === "surface")) {
+      this.rememberSelection(null);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
     if ((event.key === "r" || event.key === "R") &&
       !event.ctrlKey && !event.metaKey && !event.altKey) {
       event.preventDefault();
@@ -3067,6 +3274,7 @@ export class GologScene {
       if (this.modeHead && !this.modeHead.canInspectNestedGolog()) {
         return;
       }
+      this.synchronizeForceLayout();
       const selectable = this.pickSelectable({ preferSphere: true });
       if (!selectable || event.repeat) {
         if (!event.repeat) {
@@ -3178,6 +3386,7 @@ export class GologScene {
     if (!boundary) {
       return this.emitVirtualCellCaptureChanged();
     }
+    this.synchronizeForceLayout();
     const id = `virtual-cell-${this.state.nextSurfaceId}`;
     this.bus.emit("element:create", {
       id,
@@ -3193,6 +3402,7 @@ export class GologScene {
       return false;
     }
 
+    this.synchronizeForceLayout();
     const selectable = this.pickSelectable();
     if (selectable?.kind !== "edge") {
       return false;
@@ -3203,9 +3413,12 @@ export class GologScene {
       clientId: this.client.id,
       clientIp: this.client.ip,
     });
-    this.selectionBuffer = this.selectionBuffer.filter(
-      (entry) => entry.id !== selectable.id,
-    );
+    if (this.selectionBuffer.some((entry) => entry.id === selectable.id) &&
+        this.selectionBuffer.some((entry) => entry.kind === "surface")) {
+      this.rememberSelection(null);
+    } else {
+      this.selectionBuffer = this.selectionBuffer.filter((entry) => entry.id !== selectable.id);
+    }
     return true;
   }
 
@@ -3279,7 +3492,43 @@ export class GologScene {
     };
   }
 
-  setPointerFromEvent(event) {
+  synchronizeForceLayout() {
+    if (this.flushForceLayout) {
+      this.flushForceLayout();
+      this.bus.flush();
+    }
+  }
+
+  residentInteraction() {
+    return Boolean(this.forceLayoutController?.resident && this.forceLayoutController?.localInteraction);
+  }
+
+  // DOM overlays need only their own anchors, never a full coordinate checkpoint.
+  residentAnchor(id) {
+    if (!this.residentInteraction()) return null;
+    const solver = this.forceLayoutController.simulation;
+    if (this.anchorCache?.solver !== solver || this.anchorCache.version !== solver.geometryVersion) {
+      this.anchorCache = { solver, version: solver.geometryVersion, points: new Map() };
+    }
+    if (!this.anchorCache.points.has(id)) {
+      const point = this.forceLayoutController.readPosition(id);
+      this.anchorCache.points.set(id, point ? new THREE.Vector3(...point) : null);
+    }
+    return this.anchorCache.points.get(id)?.clone() ?? null;
+  }
+
+  handlePatchSnapshot(handle) {
+    const property = handle.dof === 3 ? "position" : handle.dof === 2 ? "bend" : "controlCoordinate";
+    return { objectId: handle.id,
+      collection: handle.dof === 3 ? "spheres" : handle.dof === 2 ? "edges" : "surfaces",
+      properties: { [property]: handle.dof === 1 ? handle.coordinates[0] : handle.coordinates.slice(0, handle.dof) } };
+  }
+
+  setPointerFromEvent(event, { synchronize = true } = {}) {
+    if (synchronize) {
+      this.prepareForceLayout?.();
+      if (!this.residentInteraction()) this.synchronizeForceLayout();
+    }
     const viewport = this.activeCanvasViewportClientRect();
     this.lastPointerClient = new THREE.Vector2(event.clientX, event.clientY);
     this.pointer.x =
@@ -3330,17 +3579,17 @@ export class GologScene {
     this.surfaceRenderer.updateSelection(selectedSurfaceId);
   }
 
-  makeEdgeMidpointDrag(edge, event) {
+  makeEdgeMidpointDrag(edge, event, normal = null) {
     if (!edge) {
       return null;
     }
     const source = this.sphereMeshes.get(edge.sourceId);
     const target = this.sphereMeshes.get(edge.targetId);
-    if (!source || !target) {
+    if (!normal && (!source || !target)) {
       return null;
     }
 
-    const normal = target.position.clone().sub(source.position).normalize();
+    normal ??= target.position.clone().sub(source.position).normalize();
     const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
       normal,
       edge.midpoint,
@@ -3947,7 +4196,46 @@ export class GologScene {
     };
   }
 
+  bindForceLayout(solver, flush = null, controller = null) {
+    const previousSolver = this.layoutRenderAdapter.solver;
+    const changed = controller !== this.forceLayoutController || solver !== previousSolver;
+    if (this.pendingPointer?.stagedDrag?.drag?.resident && changed) {
+      this.pendingPointer = null;
+    }
+    if (this.drag?.resident && changed) {
+      const drag = this.drag;
+      this.drag = null;
+      this.releaseDragAuthority(drag, { retiring: true, solver: previousSolver });
+    }
+    this.flushForceLayout = flush;
+    this.forceLayoutController = controller;
+    this.layoutRenderAdapter.bind(solver);
+  }
+
+  bindPreviewForceLayout(gologId, solver) {
+    if (solver) this.previewLayoutSolvers.set(gologId, solver);
+    else this.previewLayoutSolvers.delete(gologId);
+    this.refreshPreviewForceLayouts();
+  }
+
+  refreshPreviewForceLayouts() {
+    for (const preview of this.nestedPreviews.values()) {
+      const solver = this.previewLayoutSolvers.get(preview.childGolog?.id);
+      if (!solver) {
+        preview.layoutRenderAdapter?.dispose();
+        preview.layoutRenderAdapter = null;
+        continue;
+      }
+      preview.layoutRenderAdapter ??= new LayoutRenderAdapter({ renderer: this.renderer, content: preview.content });
+      preview.layoutRenderAdapter.bind(solver);
+      preview.layoutRenderAdapter.setParent(this.layoutRenderAdapter.solver, preview.objectId, preview.content.position);
+      preview.layoutRenderAdapter.refresh();
+    }
+  }
+
   renderFrame() {
+    this.layoutRenderAdapter.refresh();
+    this.refreshPreviewForceLayouts();
     const viewport = this.activeCanvasViewport();
     const bottom = Math.max(
       0,
@@ -3999,6 +4287,7 @@ export class GologScene {
     this.updateCameraFromKeys(elapsedSeconds);
     this.updateLabelRenderOrder();
     this.updatePayloadBillboardPreviewTransform();
+    this.updateDomOverlays?.();
     this.updateCenterInterestMarker();
     this.renderFrame();
   }

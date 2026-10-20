@@ -8,6 +8,14 @@ import {
 const DEGENERATE_DIRECTION_EPSILON = 1e-10;
 const TRIANGLE_BARYCENTER = Object.freeze({ a: 1 / 3, b: 1 / 3, c: 1 / 3 });
 
+export function createTwoCellFaceDirection({ firstEdgeMidpoint, secondEdgeMidpoint }) {
+  // Native 2-cells point from the source d1 to the target d0.
+  const direction = secondEdgeMidpoint.clone().sub(firstEdgeMidpoint);
+  return direction.lengthSq() > DEGENERATE_DIRECTION_EPSILON
+    ? direction.normalize()
+    : null;
+}
+
 export function createTwoCellControlLine({
   firstEdge,
   secondEdge,
@@ -31,6 +39,7 @@ export function createTwoCellControlLine({
   }
 
   direction.normalize();
+  if (previousDirection?.dot?.(direction) < 0) direction.negate();
   return {
     origin: boundaryCenter,
     direction,
@@ -62,6 +71,7 @@ export function createTwoSimplexControlLine({
   }
 
   direction.normalize();
+  if (previousDirection?.dot?.(direction) < 0) direction.negate();
   return {
     origin,
     direction,

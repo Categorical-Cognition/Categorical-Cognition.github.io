@@ -6,9 +6,9 @@ export function cloneStoreValue(value) {
     return value.map((entry) => cloneStoreValue(entry));
   }
   if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [key, cloneStoreValue(entry)]),
-    );
+    const entries = Object.entries(value);
+    for (const entry of entries) entry[1] = cloneStoreValue(entry[1]);
+    return Object.fromEntries(entries);
   }
   return value;
 }

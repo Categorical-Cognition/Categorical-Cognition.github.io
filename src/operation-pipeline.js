@@ -104,9 +104,11 @@ export class OperationPipeline {
         });
     }
 
-    const result = this.finishCommit(normalized, commitDecision);
-    this.releaseAutoClaims(autoClaims, normalized);
-    return result;
+    try {
+      return this.finishCommit(normalized, commitDecision);
+    } finally {
+      this.releaseAutoClaims(autoClaims, normalized);
+    }
   }
 
   finishCommit(normalized, commitDecision) {

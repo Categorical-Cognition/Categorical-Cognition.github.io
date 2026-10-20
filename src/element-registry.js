@@ -1,7 +1,6 @@
 import {
   ELEMENT_KINDS,
   defaultElementDefinitions as defaultStructureElementDefinitions,
-  defaultElementProviders as defaultStructureElementProviders,
 } from "./hierarchical-theta-space-definition.js";
 import {
   createDefaultSchemaRegistry,
@@ -15,31 +14,6 @@ import { structureDefinitionFor } from "./structure-definition-registry.js";
 import { thetaVolumeSchemaRef, validateThetaVolumeElement, THETA_VOLUME_KIND } from "./theta-volume-definition.js";
 
 export { ELEMENT_KINDS, VIRTUAL_DOUBLE_ELEMENT_KINDS };
-
-export const ELEMENT_DECLARATION_SET_FORMAT = "golog.element-declaration-set";
-export const ELEMENT_DECLARATION_SET_VERSION = 1;
-
-function cloneValue(value) {
-  if (value?.clone) {
-    return value.clone();
-  }
-  if (Array.isArray(value)) {
-    return value.map((entry) => cloneValue(entry));
-  }
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [key, cloneValue(entry)]),
-    );
-  }
-  return value;
-}
-
-function declarationCounts(declarations) {
-  return declarations.reduce((counts, declaration) => {
-    counts[declaration.kind] = (counts[declaration.kind] ?? 0) + 1;
-    return counts;
-  }, {});
-}
 
 export function normalizeElementKind(kind) {
   return DEFAULT_MATH_SCHEMA_REGISTRY.normalizeElementKind(kind);
@@ -60,20 +34,14 @@ export function defaultElementDefinitions() {
   ];
 }
 
-export function defaultElementProviders() {
-  return defaultStructureElementProviders();
-}
-
 export class ElementRegistry {
   constructor({
     definitions = defaultElementDefinitions(),
-    providers = defaultElementProviders(),
     schemaRegistry = createDefaultSchemaRegistry(),
   } = {}) {
     this.definitions = new Map(
       definitions.map((definition) => [definition.elementKind, definition]),
     );
-    this.providers = [...providers];
     this.schemaRegistry = schemaRegistry;
   }
 
@@ -83,13 +51,6 @@ export class ElementRegistry {
       if (this.definitions.get(definition.elementKind) === definition) {
         this.definitions.delete(definition.elementKind);
       }
-    };
-  }
-
-  register(provider) {
-    this.providers.push(provider);
-    return () => {
-      this.providers = this.providers.filter((entry) => entry !== provider);
     };
   }
 
@@ -150,36 +111,7 @@ export class ElementRegistry {
     return definition.create(store, prepared);
   }
 
-  collectElements(graph, options = {}) {
-    return this.providers.flatMap((provider) => provider(graph, options) ?? []);
-  }
 
-  collectDeclarations(graph, options = {}) {
-    const elements = this.collectElements(graph, options);
-    const declarations = elements.flatMap((element) =>
-      (element.declarations ?? []).map((declaration) => ({
-        ...cloneValue(declaration),
-        elementKind: declaration.elementKind ?? element.elementKind,
-        objectId: declaration.objectId ?? element.objectId ?? undefined,
-      })),
-    );
-    return {
-      format: ELEMENT_DECLARATION_SET_FORMAT,
-      version: ELEMENT_DECLARATION_SET_VERSION,
-      gologId: graph.gologId,
-      elements,
-      declarations,
-      counts: declarationCounts(declarations),
-      elementCounts: elements.reduce((counts, element) => {
-        counts[element.elementKind] = (counts[element.elementKind] ?? 0) + 1;
-        return counts;
-      }, {}),
-    };
-  }
-
-  collect(graph, options = {}) {
-    return this.collectDeclarations(graph, options);
-  }
 }
 
 export function createElementRegistry(options = {}) {

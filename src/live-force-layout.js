@@ -1,971 +1,418 @@
 import { partitionForceLayoutGraph } from "./distributed-force-layout.js";
-import {
-  CONVERGENCE_OBSERVATION_SOURCES,
-  SEMANTIC_CONVERGENCE_CHANGED_EVENT,
-} from "./semantic-convergence-service.js";
+import { CONVERGENCE_OBSERVATION_SOURCES, SEMANTIC_CONVERGENCE_CHANGED_EVENT } from "./semantic-convergence-service.js";
 import { LOCAL_SHEAF_GLUE_CHANGED_EVENT } from "./local-sheaf-glue-service.js";
-import { peerHolderId } from "./peer-context.js";
 import { normalizeClaimant, RESOURCE_CLAIMS_CHANGED_EVENT } from "./resource-claim-manager.js";
+import { parseResourceId } from "./resource-ids.js";
+import { peerHolderId } from "./peer-context.js";
+import { DEFAULT_LAYOUT_SETTINGS, LAYOUT_SCHEMAS, layoutCoordinateSignature, normalizeLayoutSettings } from "./layout-schema.js";
+import { coordinateSnapshot, filterLayoutResult, changedLayoutResult, layoutResultSize } from "./force-layout-controller.js";
 
-export const LIVE_FORCE_LAYOUT_DEFAULTS = Object.freeze({
-  enabled: true,
-  gravity: 0.02,
-  repulsion: 8,
-  edgePull: 0.08,
-  edgePlaneGravity: 0.035,
-  samePlaneEdgeRepulsion: 0.018,
-  oppositeArrowEdgeRepulsion: 0.028,
-  twoSimplexNodeBarycenter: 0.0012,
-  twoSimplexEdgeBarycenter: 0.0018,
-  twoSimplexFaceTightening: 1.8,
-  globalCoherence: 0.08,
-  restLength: 2.4,
-  commitIntervalMs: 48,
-});
-export const LIVE_FORCE_LAYOUT_DEFAULT_STORAGE_KEY =
-  "jsgolog.live-force-layout.defaults.v1";
-const FORCE_SETTING_RANGES = Object.freeze({
-  gravity: [0, 0.05],
-  repulsion: [0, 20],
-  edgePull: [0, 0.2],
-  edgePlaneGravity: [0, 0.2],
-  samePlaneEdgeRepulsion: [0, 0.2],
-  oppositeArrowEdgeRepulsion: [0, 0.2],
-  twoSimplexNodeBarycenter: [0, 0.05],
-  twoSimplexEdgeBarycenter: [0, 0.05],
-  twoSimplexFaceTightening: [1, 4],
-  globalCoherence: [0, 1],
-});
-export const LIVE_FORCE_LAYOUT_SETTING_KEYS = Object.freeze(Object.keys(FORCE_SETTING_RANGES));
-
-const POSITION_EPSILON_SQ = 1e-12;
-const FORCE_COMMIT_DEADBAND_SQ = 0.015 * 0.015;
-const FORCE_COMMIT_CLAIM_TTL_MS = 30_000;
-const FORCE_COMMIT_CLAIM_RETRY_MS = 2_000;
-const FORCE_COMMIT_MIN_INTERVAL_MS = 120;
-const FORCE_SOLVER_ACTIVITY_WINDOW_MS = 8_000;
-const FORCE_QUIESCENCE_FORCE_SQ = 0.00001 * 0.00001;
-const FORCE_QUIESCENCE_MOVEMENT_SQ = 0.00001 * 0.00001;
-const FORCE_QUIESCENCE_TICKS = 3;
-export const LIVE_FORCE_LAYOUT_SETTINGS_CHANGED_EVENT =
-  "live-force-layout:settings-changed";
-
-function finiteNumber(value, fallback) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
-}
-
-function clamp(value, min, max) {
-  return Math.min(Math.max(value, min), max);
-}
-
-function forceSettingValues(settings = {}) {
-  return Object.fromEntries(
-    LIVE_FORCE_LAYOUT_SETTING_KEYS.flatMap((key) => {
-      const number = Number(settings[key]);
-      return Number.isFinite(number)
-        ? [[key, clamp(number, ...FORCE_SETTING_RANGES[key])]] : [];
-    }),
-  );
-}
-
-export function readLiveForceLayoutDefaultSettings(storage = null) {
-  if (!storage?.getItem) {
-    return {};
+export const LIVE_FORCE_LAYOUT_DEFAULTS = Object.freeze({ ...DEFAULT_LAYOUT_SETTINGS,
+  enabled: true, globalCoherence: 0.08, commitIntervalMs: 250 });
+export const LIVE_FORCE_LAYOUT_DEFAULT_STORAGE_KEY = "golog.live-force-layout.defaults.v2";
+export const LIVE_FORCE_LAYOUT_SETTING_KEYS = Object.freeze([...Object.keys(DEFAULT_LAYOUT_SETTINGS), "globalCoherence"]);
+export const LIVE_FORCE_LAYOUT_SETTINGS_CHANGED_EVENT = "live-force-layout:settings-changed";
+const resolve = (value) => typeof value === "function" ? value() : value;
+const clock = () => globalThis.performance?.now?.() ?? Date.now();
+const countKey = (store) => [store.spheres.size, store.edges.size, store.surfaces.size, store.volumes?.size ?? 0].join(":");
+const different = (a, b, tolerance = 1e-6) => !a || a.length !== b.length || Math.hypot(...b.map((x, i) => x - a[i])) > tolerance;
+function settingValues(settings = {}) {
+  const result = normalizeLayoutSettings(settings);
+  for (const key of ["globalCoherence", "commitIntervalMs"]) {
+    const value = settings[key] ?? LIVE_FORCE_LAYOUT_DEFAULTS[key];
+    if (!Number.isFinite(Number(value)) || Number(value) < 0) throw new Error(`Invalid layout setting: ${key}`);
+    result[key] = Number(value);
   }
-  try {
-    return forceSettingValues(
-      JSON.parse(storage.getItem(LIVE_FORCE_LAYOUT_DEFAULT_STORAGE_KEY) ?? "{}"),
-    );
-  } catch {
-    return {};
-  }
+  return { ...result, enabled: settings.enabled ?? true };
+}
+export function readLiveForceLayoutDefaultSettings(storage) {
+  try { return storage?.getItem ? settingValues(JSON.parse(storage.getItem(LIVE_FORCE_LAYOUT_DEFAULT_STORAGE_KEY) ?? "{}")) : {}; }
+  catch { return {}; }
+}
+export function writeLiveForceLayoutDefaultSettings(storage, settings = {}) {
+  if (!storage?.setItem) return { ok: false, reason: "storage-unavailable" };
+  const defaults = settingValues(settings);
+  try { storage.setItem(LIVE_FORCE_LAYOUT_DEFAULT_STORAGE_KEY, JSON.stringify(defaults)); return { ok: true, defaults }; }
+  catch (error) { return { ok: false, reason: "storage-write-failed", error: error.message }; }
+}
+function sharedIntents(store, strength) {
+  return (store.semanticConvergence?.intents?.({ strength }) ?? []).filter((intent) =>
+    intent.observationSources?.[CONVERGENCE_OBSERVATION_SOURCES.GLOBAL_COMMIT] > 0);
 }
 
-export function writeLiveForceLayoutDefaultSettings(storage = null, settings = {}) {
-  if (!storage?.setItem) {
-    return { ok: false, reason: "storage-unavailable" };
-  }
-  const defaults = forceSettingValues(settings);
-  try {
-    storage.setItem(
-      LIVE_FORCE_LAYOUT_DEFAULT_STORAGE_KEY,
-      JSON.stringify(defaults),
-    );
-    return { ok: true, defaults };
-  } catch (error) {
-    return {
-      ok: false,
-      reason: "storage-write-failed",
-      error: error.message,
-    };
-  }
-}
-
-function topologySignature(store) {
-  const sphereIds = [...store.spheres.keys()].sort().join(",");
-  const edgeIds = [...store.edges.values()]
-    .map((edge) => `${edge.id}:${edge.sourceId}->${edge.targetId}`)
-    .sort()
-    .join(",");
-  const surfaceIds = [...store.surfaces.values()]
-    .map((surface) => `${surface.id}:${surface.type}:${surface.edgeIds.join("+")}`)
-    .sort()
-    .join(",");
-  return `${sphereIds}|${edgeIds}|${surfaceIds}`;
-}
-
-function positionEventsForStore(store, pinnedSphereIds = new Set()) {
-  return [
-    ...[...store.spheres.values()].map((sphere) => {
-      const pinned = pinnedSphereIds.has(sphere.id);
-      return {
-        id: sphere.id,
-        position: sphere.position,
-        pinned,
-        resetVelocity: pinned,
-      };
-    }),
-    ...[...store.edges.values()].map((edge) => ({
-      id: edge.id,
-      position: edge.midpoint,
-      resetVelocity: false,
-    })),
-  ];
-}
-
-function humanControlledSphereIds(store) {
-  if (store?.localSheafGlue?.activeHumanSphereIds) {
-    return store.localSheafGlue.activeHumanSphereIds();
-  }
-  return new Set();
-}
-
-function withoutHumanClaimedPositions(result, humanClaimedIds) {
-  if (!humanClaimedIds?.size) {
-    return result;
-  }
-  return {
-    ...result,
-    positions: (result?.positions ?? []).filter(
-      (entry) => !humanClaimedIds.has(entry.id),
-    ),
-    edgeControls: (result?.edgeControls ?? []).filter(
-      (entry) => !humanClaimedIds.has(entry.id),
-    ),
-  };
-}
-
-function positionSnapshot(store) {
-  return new Map(
-    [
-      ...(store?.spheres?.values?.() ?? []),
-      ...(store?.edges?.values?.() ?? []),
-    ].map((object) => [
-      object.id,
-      (object.bend ?? object.position ?? object.midpoint).clone(),
-    ]),
-  );
-}
-
-function resultMovedSnapshot(result, snapshot, epsilonSq = POSITION_EPSILON_SQ) {
-  return [...(result?.positions ?? []), ...(result?.edgeControls ?? [])].some((entry) => {
-    const previous = snapshot.get(entry.id);
-    const next = entry.bend ?? entry.position ?? entry.midpoint;
-    return previous && next && previous.distanceToSquared(next) > epsilonSq;
-  });
-}
-
-function resultEntriesMovedSince(result, snapshot, epsilonSq = POSITION_EPSILON_SQ) {
-  return {
-    ...result,
-    positions: (result?.positions ?? []).filter((entry) => {
-      const previous = snapshot.get(entry.id);
-      return (
-        previous &&
-        entry.position &&
-        previous.distanceToSquared(entry.position) > epsilonSq
-      );
-    }),
-    edgeControls: (result?.edgeControls ?? []).filter((entry) => {
-      const previous = snapshot.get(entry.id);
-      return (
-        previous &&
-        entry.midpoint &&
-        previous.distanceToSquared(entry.bend ?? entry.midpoint) > epsilonSq
-      );
-    }),
-  };
-}
-
-function recordSnapshotEntries(snapshot, positions = [], edgeControls = []) {
-  const next = snapshot ?? new Map();
-  for (const entry of [...positions, ...edgeControls]) {
-    const value = entry?.bend ?? entry?.position ?? entry?.midpoint;
-    if (!entry?.id || !value) {
-      continue;
+// Main and expanded layers share input tracking, numerical execution and barriers.
+// Publication remains an authority concern of the enclosing live service.
+class LayoutLayer {
+  constructor(owner, golog) {
+    Object.assign(this, { owner, golog, controller: null, quiescent: false, topologyDirty: true,
+      inputsDirty: true, pendingIds: new Set(), observed: new Map(), observedObjects: new Map(), signatures: new Map(),
+      pinIds: new Set(), lastFlushAt: -Infinity, lastStepAt: -Infinity, lastResult: null,
+      snapshotVersion: 0, snapshotPending: null, releases: [] });
+    const on = (type, handler) => this.releases.push(golog.bus.on(type, handler));
+    on("store:object-upserted", (record) => this.observe(record));
+    on("store:object-deleted", (record) => {
+      if (LAYOUT_SCHEMAS[record.elementKind]) { this.topologyDirty = true; this.wake(); }
+    });
+    on("state:changed", () => {
+      if (countKey(golog.state) !== this.counts) { this.topologyDirty = true; this.wake(); }
+    });
+    const inputEvents = [RESOURCE_CLAIMS_CHANGED_EVENT, LOCAL_SHEAF_GLUE_CHANGED_EVENT];
+    if (owner.publicationMode !== "local") inputEvents.push(SEMANTIC_CONVERGENCE_CHANGED_EVENT);
+    for (const event of inputEvents) {
+      on(event, () => { this.inputsDirty = true; this.snapshotVersion++; this.owner.schedule(); });
     }
-    next.set(entry.id, value.clone?.() ?? value);
   }
-  return next;
-}
-
-function resolveOrigin(origin) {
-  return typeof origin === "function" ? origin() : origin;
-}
-
-function originSignature(origin) {
-  const resolved = resolveOrigin(origin);
-  if (!resolved) {
-    return "none";
+  settings() { return typeof this.owner.settings === "function" ? this.owner.settings() : this.owner.settings; }
+  wake(ids = null) { this.snapshotVersion++; this.quiescent = false; this.controller?.wake(ids); this.owner.schedule(); }
+  observe(object) {
+    object = this.golog.state.objects.get(object.id);
+    if (!object || this.observedObjects.get(object.id) === object) return;
+    const schema = LAYOUT_SCHEMAS[object.elementKind];
+    if (!schema) return;
+    const record = this.golog.state[schema.collection].get(object.id);
+    if (!record) return;
+    if (this.signatures.get(object.id) !== schema.boundarySignature(record)) {
+      this.topologyDirty = true; this.wake();
+    }
+    const next = schema.dof ? layoutCoordinateSignature({ id: object.id, schema }, this.golog.state) : [];
+    if (different(this.observed.get(object.id), next)) {
+      this.observed.set(object.id, next); this.pendingIds.add(object.id); this.inputsDirty = true;
+      // The next input upload wakes the union once, after this event burst.
+      this.snapshotVersion++; this.quiescent = false; this.owner.schedule();
+    }
+    this.observedObjects.set(object.id, object);
   }
-  return [
-    resolved.peerId ?? "",
-    resolved.sessionId ?? "",
-    resolved.clientId ?? "",
-    resolved.source ?? "",
-  ].join("|");
-}
-
-function recentLayoutObserverKeys(store, now = Date.now()) {
-  const keys = new Set();
-  for (const target of store?.semanticConvergence?.snapshot?.().targets ?? []) {
-    for (const observation of target.observations ?? []) {
-      if (
-        observation.operationType !== "layout:commit" ||
-        !observation.observerKey ||
-        now - Number(observation.observedAt ?? 0) > FORCE_SOLVER_ACTIVITY_WINDOW_MS
-      ) {
-        continue;
+  updatePins() {
+    const store = this.golog.state, pins = new Set();
+    let expiry = Infinity;
+    for (const record of store.localSheafGlue?.activeInteractionRecords?.({ localOnly: this.owner.publicationMode === "local" }) ?? []) {
+      expiry = Math.min(expiry, Number(record.expiresAt ?? Infinity));
+      for (const resource of [record.resourceId, record.targetResourceId]) {
+        if (!resource) continue;
+        try {
+          const parsed = parseResourceId(resource);
+          if (parsed.gologId === store.gologId && parsed.objectId) pins.add(parsed.objectId);
+        } catch { /* Non-coordinate authority resources do not pin layout. */ }
       }
-      keys.add(observation.observerKey);
+    }
+    this.pinIds = pins;
+    if (this.pinTimer) clearTimeout(this.pinTimer);
+    if (Number.isFinite(expiry)) {
+      this.pinTimer = setTimeout(() => { this.inputsDirty = true; this.snapshotVersion++; this.owner.schedule(); }, Math.max(1, expiry - Date.now() + 1));
+      this.pinTimer.unref?.();
     }
   }
-  return keys;
-}
-
-function claimedResourceHolderKeys(store) {
-  const keys = new Set();
-  for (const claim of store?.resourceClaims?.snapshot?.() ?? []) {
-    if (claim?.holderId) {
-      keys.add(claim.holderId);
-    }
-  }
-  return keys;
-}
-
-function maxForceMagnitudeSq(result) {
-  return (result?.forceTotals ?? []).reduce(
-    (maximum, entry) => Math.max(maximum, entry.force?.lengthSq?.() ?? 0), 0,
-  );
-}
-
-function sharedConvergenceIntents(store, strength) {
-  // A local edit or layout publication is not an external position constraint.
-  // Otherwise the browser's own drag history becomes a permanent spring.
-  return (store.semanticConvergence?.intents?.({ strength }) ?? []).filter(
-    (intent) => intent.observationSources?.[CONVERGENCE_OBSERVATION_SOURCES.GLOBAL_COMMIT] > 0,
-  );
-}
-
-// Main and nested views share one numerical policy. Scheduling and publication
-// are adapters around the same force controller, not separate physical laws.
-function forceOptionsFor(store, settings) {
-  const vertexCount = store.spheres.size;
-  const dt = vertexCount > 160 ? 0.36 : 0.48;
-  return {
-    graphOptions: { edgeStrength: settings.edgePull, defaultRestLength: settings.restLength },
-    fieldOptions: {
-      centerStrength: settings.gravity,
-      chargeStrength: settings.repulsion,
-      chargeApproximation: vertexCount > 80 ? "spatial-hash" : "pairwise",
-      edgePlaneGravityStrength: settings.edgePlaneGravity,
-      samePlaneEdgeRepulsionStrength: settings.samePlaneEdgeRepulsion,
-      oppositeArrowEdgeRepulsionStrength: settings.oppositeArrowEdgeRepulsion,
-      twoSimplexNodeBarycenterStrength: settings.twoSimplexNodeBarycenter,
-      twoSimplexEdgeBarycenterStrength: settings.twoSimplexEdgeBarycenter,
-      twoSimplexFaceTighteningFactor: settings.twoSimplexFaceTightening,
-    },
-    solverOptions: {
-      dt,
-      damping: 0.84,
-      maxVelocity: vertexCount > 160 ? 0.32 : 0.58,
-      forceDeadband: Math.sqrt(FORCE_QUIESCENCE_FORCE_SQ),
-      // Any force above its deadband must be able to initiate motion at rest.
-      velocityDeadband: dt * Math.sqrt(FORCE_QUIESCENCE_FORCE_SQ),
-    },
-  };
-}
-
-function stepIntervalMs(store, settings) {
-  const count = store?.spheres.size ?? 0;
-  return Math.max(settings.commitIntervalMs, count > 240 ? 120 : count > 100 ? 80 : 0);
-}
-
-export class LiveForceLayoutService {
-  constructor({
-    workspace,
-    modeHead,
-    createForceLayout,
-    frameRef = globalThis,
-    defaults = {},
-    storage = frameRef?.localStorage ?? null,
-    origin = null,
-    peerProvider = null,
-    localPeerProvider = null,
-  } = {}) {
-    this.workspace = workspace;
-    this.modeHead = modeHead;
-    this.createForceLayout = createForceLayout;
-    this.frameRef = frameRef;
-    this.origin = origin;
-    this.peerProvider = peerProvider;
-    this.localPeerProvider = localPeerProvider;
-    this.lastPartition = null;
-    this.storage = storage;
-    this.defaults = {
-      ...LIVE_FORCE_LAYOUT_DEFAULTS,
-      ...readLiveForceLayoutDefaultSettings(this.storage),
-      ...defaults,
-    };
-    this.settings = {
-      enabled: Boolean(this.defaults.enabled),
-      ...forceSettingValues(LIVE_FORCE_LAYOUT_DEFAULTS),
-      ...forceSettingValues(this.defaults),
-    };
-    this.activeGolog = null;
-    this.controller = null;
-    this.lastTopologySignature = null;
-    this.lastOriginSignature = null;
-    this.lastStepAt = 0;
-    this.lastCommitSubmittedAt = -Infinity;
-    this.lastPublishedPositionSnapshot = null;
-    this.lastClaimAttemptAt = -FORCE_COMMIT_CLAIM_RETRY_MS;
-    this.quiescent = false;
-    this.quietStepCount = 0;
-    this.lastMaxForceMagnitudeSq = null;
-    this.applyingForcePreview = false;
-    this.frameHandle = null;
-    this.releaseStateListener = null;
-    this.releaseConvergenceListener = null;
-    this.releaseGlueListener = null;
-    this.releaseClaimsListener = null;
-    this.releaseWorkspaceListener = this.workspace?.bus?.on(
-      "workspace:active-changed",
-      ({ golog }) => this.bindActiveGolog(golog),
-    );
-    this.releaseModeListener = this.workspace?.bus?.on("mode:changed", () =>
-      this.schedule(),
-    );
-    this.bindActiveGolog(this.workspace?.activeGolog?.() ?? null);
-  }
-
-  snapshot() {
-    return {
-      ...this.settings,
-      active: this.canRun(),
-      solving: this.canRun() && !this.quiescent,
-      quiescent: this.quiescent,
-      quietStepCount: this.quietStepCount,
-      lastMaxForce: this.lastMaxForceMagnitudeSq === null
-        ? null
-        : Math.sqrt(this.lastMaxForceMagnitudeSq),
-      distributedPeerCount: this.currentPeers().length,
-      localPeerId: this.localPeer()?.peerId ?? null,
-      assignedNodeCount: this.lastPartition
-        ? [...this.lastPartition.ownedIds].filter((id) => this.activeGolog.state.spheres.has(id)).length
-        : null,
-    };
-  }
-
-  emitSettingsChanged() {
-    this.workspace?.bus?.emit?.(
-      LIVE_FORCE_LAYOUT_SETTINGS_CHANGED_EVENT,
-      this.snapshot(),
-    );
-  }
-
-  setEnabled(enabled) {
-    this.settings.enabled = Boolean(enabled);
-    if (this.settings.enabled) {
-      this.wakeSolver();
-    }
-    this.schedule();
-    this.emitSettingsChanged();
-    return this.snapshot();
-  }
-
-  setSettings(settings = {}) {
-    const previous = JSON.stringify(this.settings);
-    if ("enabled" in settings) {
-      this.settings.enabled = Boolean(settings.enabled);
-    }
-    Object.assign(this.settings, forceSettingValues(settings));
-
-    if (JSON.stringify(this.settings) !== previous) {
-      this.resetSimulation();
-      this.schedule();
-      this.emitSettingsChanged();
-    }
-    return this.snapshot();
-  }
-
-  commitSettingsAsDefaults() {
-    this.defaults = {
-      ...this.defaults,
-      ...forceSettingValues(this.settings),
-    };
-    return {
-      ...writeLiveForceLayoutDefaultSettings(this.storage, this.defaults),
-      snapshot: this.snapshot(),
-    };
-  }
-
-  bindActiveGolog(golog) {
-    this.releaseStateListener?.();
-    this.releaseConvergenceListener?.();
-    this.releaseGlueListener?.();
-    this.releaseClaimsListener?.();
-    this.releaseStateListener = null;
-    this.releaseConvergenceListener = null;
-    this.releaseGlueListener = null;
-    this.activeGolog = golog ?? null;
-    this.resetSimulation();
-    if (this.activeGolog) {
-      this.releaseStateListener = this.activeGolog.bus.on("state:changed", () => {
-        if (!this.applyingForcePreview) {
-          this.wakeSolver();
+  ensureController() {
+    if (countKey(this.golog.state) !== this.counts) this.topologyDirty = true;
+    if (this.topologyRevision !== this.golog.state.topologyRevision) this.topologyDirty = true;
+    const origin = this.owner.operationOrigin?.() ?? resolve(this.owner.origin);
+    const originKey = JSON.stringify(origin ?? null);
+    if (this.controller && this.originKey !== originKey) this.controller.origin = origin;
+    if (!this.controller || this.topologyDirty) {
+      if (this.controller) { this.flush(); this.controller.dispose?.(); }
+      this.controller = this.owner.createForceLayout(this.golog, { gpu: true, ...(origin ? { origin } : {}) });
+      this.controller.localInteraction = this.owner.publicationMode === "local";
+      this.controller.refreshInputs = () => this.ensureController();
+      this.controller.onResidentMotion = () => {
+        this.quiescent = false; this.snapshotVersion++; this.owner.schedule();
+      };
+      this.controller.reset({ settings: this.settings() });
+      this.snapshotError = null;
+      this.originKey = originKey; this.counts = countKey(this.golog.state);
+      this.topologyRevision = this.golog.state.topologyRevision;
+      this.topologyDirty = false; this.inputsDirty = true; this.quiescent = false;
+      this.observed.clear(); this.observedObjects.clear(); this.signatures.clear();
+      for (const row of this.controller.ledger.rows) {
+        const record = this.golog.state[row.schema.collection].get(row.id);
+        this.observed.set(row.id, row.dof ? layoutCoordinateSignature(row, this.golog.state) : []);
+        this.observedObjects.set(row.id, this.golog.state.objects.get(row.id));
+        this.signatures.set(row.id, row.schema.boundarySignature(record));
+        if (this.owner.publicationMode !== "local" && this.owner.lastPublishedPositionSnapshot && !this.owner.lastPublishedPositionSnapshot.has(row.id)) {
+          this.owner.lastPublishedPositionSnapshot.set(row.id, this.observed.get(row.id));
         }
-        this.schedule();
-      });
-      this.releaseClaimsListener = this.activeGolog.bus.on(RESOURCE_CLAIMS_CHANGED_EVENT, () => {
-        this.wakeSolver();
-        this.schedule();
-      });
-      this.releaseConvergenceListener = this.activeGolog.bus.on(
-        SEMANTIC_CONVERGENCE_CHANGED_EVENT,
-        () => {
-          this.wakeSolver();
-          this.schedule();
-        },
-      );
-      this.releaseGlueListener = this.activeGolog.bus.on(
-        LOCAL_SHEAF_GLUE_CHANGED_EVENT,
-        () => {
-          this.wakeSolver();
-          this.schedule();
-        },
-      );
+      }
+      this.pendingIds.clear();
     }
-    this.schedule();
-  }
-
-  wakeSolver() {
-    this.quiescent = false;
-    this.quietStepCount = 0;
-  }
-
-  resetSimulation() {
-    this.controller = null;
-    this.lastTopologySignature = null;
-    this.lastOriginSignature = null;
-    this.lastStepAt = 0;
-    this.lastCommitSubmittedAt = -Infinity;
-    this.lastPublishedPositionSnapshot = null;
-    this.lastClaimAttemptAt = -FORCE_COMMIT_CLAIM_RETRY_MS;
-    this.quiescent = false;
-    this.quietStepCount = 0;
-    this.lastMaxForceMagnitudeSq = null;
-    this.pendingPublication = false;
-    this.lastResult = null;
-  }
-
-  canRun() {
-    return Boolean(
-      this.settings.enabled &&
-        this.localPeerCanSolve() &&
-        this.activeGolog &&
-        (this.modeHead?.canRunForces?.() ?? true) &&
-        this.activeGolog.state.spheres.size > 0,
-    );
-  }
-
-  ensureController(options = null) {
-    if (!this.activeGolog || typeof this.createForceLayout !== "function") {
-      return null;
+    this.originKey = originKey;
+    if (this.renderSuspended) {
+      this.controller.renderAdapter?.(this.controller.resident ? this.controller.simulation : null,
+        () => this.controller.flush(), this.controller);
+      this.renderSuspended = false;
     }
-    const store = this.activeGolog.state;
-    const nextSignature = topologySignature(store);
-    const origin = this.operationOrigin();
-    const nextOriginSignature = originSignature(origin);
-    if (this.lastOriginSignature !== nextOriginSignature) {
-      this.controller = null;
-      this.lastTopologySignature = null;
-      this.lastOriginSignature = nextOriginSignature;
-    }
-    if (!this.controller) {
-      this.controller = this.createForceLayout(this.activeGolog, {
-        ...(origin ? { origin } : {}),
-      });
-    }
-    if (this.lastTopologySignature !== nextSignature) {
-      this.controller.reset(options ?? this.forceOptions(store));
-      this.lastTopologySignature = nextSignature;
-      this.lastPublishedPositionSnapshot = positionSnapshot(store);
+    if (this.inputsDirty) {
+      this.updatePins();
+      const external = this.owner.externalIntentProvider?.({ golog: this.golog, store: this.golog.state,
+        entry: this, universe: this.owner }) ?? [];
+      this.controller.syncInputs({ ids: [...this.pendingIds], pinIds: [...this.pinIds],
+        externalIntents: [this.owner.publicationMode === "local" ? []
+          : sharedIntents(this.golog.state, this.settings().globalCoherence), external] });
+      this.pendingIds.clear(); this.inputsDirty = false;
+      this.quiescent = this.controller.diagnostics?.().activeGroupCount === 0;
     }
     return this.controller;
   }
-
-  currentPeers() {
-    const peers =
-      typeof this.peerProvider === "function" ? this.peerProvider() : [];
-    return Array.isArray(peers)
-      ? peers.filter((peer) => peer?.peerId && peer.peerId !== "peer-unknown")
-      : [];
+  apply(result) {
+    if (!result) return result;
+    for (const row of this.controller.ledger.rows) {
+      const object = this.golog.state.objects.get(row.id);
+      if (object) this.observe(object);
+    }
+    const residentDrags = this.owner.publicationMode === "local" && this.controller.resident
+      ? this.controller.simulation?.dragIds : null;
+    const filtered = filterLayoutResult(result, (entry) => (!this.pinIds.has(entry.id) || residentDrags?.has(entry.id)) && !this.pendingIds.has(entry.id)
+      && this.golog.state.hasSelectableSimplex(entry.id));
+    const store = this.golog.state;
+    store.applyLayoutPreviewPositions?.(filtered.positions, filtered.edgeControls, filtered.surfaceControls);
+    // Store geometry transports published gauges to its exact boundary. Record
+    // that canonical result so our queued events do not masquerade as input.
+    for (const row of this.controller.ledger.rows) {
+      const object = store.objects.get(row.id);
+      if (!object || this.observedObjects.get(row.id) === object) continue;
+      const signature = row.dof ? layoutCoordinateSignature(row, store) : [];
+      if (signature) { this.observed.set(row.id, signature); this.observedObjects.set(row.id, object); }
+    }
+    this.lastResult = filtered;
+    return filtered;
   }
-
-  activeForcePeers(store) {
-    const peers = this.currentPeers().filter((peer) => peer.role !== "observer");
-    const localPeer = this.localPeer();
-    const localKey = localPeer ? peerHolderId(localPeer) : null;
-    const recentSolverKeys = recentLayoutObserverKeys(store);
-    const claimedHolderKeys = claimedResourceHolderKeys(store);
-    const activePeers = peers.filter((peer) => {
-      const key = peerHolderId(peer);
-      return (
-        key === localKey ||
-        recentSolverKeys.has(key) ||
-        claimedHolderKeys.has(key)
-      );
-    });
-    if (localPeer?.peerId && !activePeers.some((peer) => peerHolderId(peer) === localKey)) {
-      activePeers.push(localPeer);
+  flush() {
+    if (!this.controller) return null;
+    this.snapshotVersion++;
+    // A synchronous save/pick may precede the queued domain events.
+    for (const row of this.controller.ledger.rows) {
+      const object = this.golog.state.objects.get(row.id);
+      if (object) this.observe(object);
     }
-    return activePeers;
-  }
-
-  localPeer() {
-    const peer =
-      typeof this.localPeerProvider === "function"
-        ? this.localPeerProvider()
-        : null;
-    return peer?.peerId ? peer : null;
-  }
-
-  localPeerCanSolve() {
-    const peer = this.localPeer();
-    return !peer || peer.role !== "observer";
-  }
-
-  operationOrigin() {
-    return this.localPeer() ?? resolveOrigin(this.origin);
-  }
-
-  forceOptions(store) {
-    return forceOptionsFor(store, { ...this.defaults, ...this.settings });
-  }
-
-  currentIntervalMs() {
-    return stepIntervalMs(this.activeGolog?.state, this.defaults);
-  }
-
-  schedule() {
-    if (this.frameHandle || (this.quiescent && !this.pendingPublication) || !this.canRun()) {
-      return;
-    }
-    this.frameHandle = this.frameRef.requestAnimationFrame?.((time) =>
-      this.tick(time),
-    );
-  }
-
-  tick(time = performance.now()) {
-    this.frameHandle = null;
-    if (!this.canRun()) {
-      return;
-    }
-
-    if (time - this.lastStepAt >= this.currentIntervalMs()) {
-      this.step();
-      this.lastStepAt = time;
-    }
-    this.schedule();
-  }
-
-  step() {
-    if (this.quiescent && !this.pendingPublication) {
-      return null;
-    }
-    const store = this.activeGolog?.state;
-    const options = store ? this.forceOptions(store) : null;
-    const controller = this.ensureController(options);
-    if (!store || !controller) {
-      return null;
-    }
-    const preStepPositions = positionSnapshot(store);
-    const humanControlledIds = humanControlledSphereIds(store);
-    const result = this.quiescent && this.lastResult ? this.lastResult : controller.step({
-      positionEvents: positionEventsForStore(store, humanControlledIds),
-      externalIntents: sharedConvergenceIntents(store, this.settings.globalCoherence),
-    });
-    this.lastResult = result;
-    const previewResult = withoutHumanClaimedPositions(result, humanControlledIds);
-    const commitResult = this.restrictToOwnedShard(previewResult, controller, options);
-    const movedBeyondRestTolerance = resultMovedSnapshot(
-      previewResult,
-      preStepPositions,
-      FORCE_QUIESCENCE_MOVEMENT_SQ,
-    );
-    this.lastMaxForceMagnitudeSq = maxForceMagnitudeSq(result);
-    if (
-      this.lastMaxForceMagnitudeSq <= FORCE_QUIESCENCE_FORCE_SQ &&
-      !movedBeyondRestTolerance
-    ) {
-      this.quietStepCount += 1;
-    } else {
-      this.quietStepCount = 0;
-    }
-    this.lastPublishedPositionSnapshot ??= preStepPositions;
-    const now = performance.now();
-    const publishResult = resultEntriesMovedSince(
-      commitResult,
-      this.lastPublishedPositionSnapshot,
-      FORCE_COMMIT_DEADBAND_SQ,
-    );
-    this.pendingPublication =
-      (publishResult.positions?.length ?? 0) + (publishResult.edgeControls?.length ?? 0) > 0;
-    const shouldCommit = this.pendingPublication &&
-      now - this.lastCommitSubmittedAt >= FORCE_COMMIT_MIN_INTERVAL_MS;
-    // Retain small steps: the next tick reads these coordinates as its input.
-    // A visual threshold here would discard slow motion before it accumulates.
-    if (resultMovedSnapshot(previewResult, preStepPositions)) {
-      this.applyingForcePreview = true;
-      store.applyLayoutPreviewPositions?.(
-        previewResult.positions,
-        previewResult.edgeControls,
-      );
-      queueMicrotask(() => {
-        this.applyingForcePreview = false;
-      });
-    }
-    if (shouldCommit) {
-      const operation = controller.createCommitOperation(publishResult, {
-        layoutId: "live-force-layout",
-        filterUnchanged: false,
-      });
-      const decision = store.mutationPolicy?.evaluate?.(operation, { emit: false });
-      if (decision?.ok) {
-        controller.submitCommitOperation(operation);
-        this.pendingPublication = false;
-        this.lastCommitSubmittedAt = now;
-        this.lastPublishedPositionSnapshot = recordSnapshotEntries(
-          this.lastPublishedPositionSnapshot,
-          publishResult.positions,
-          publishResult.edgeControls,
-        );
-      } else {
-        this.pendingPublication = decision?.reason === "missing-resource-claim";
-        this.ensureCommitClaims(store, operation, decision);
-      }
-    }
-    if (this.quietStepCount >= FORCE_QUIESCENCE_TICKS) {
-      this.quiescent = true;
-    }
+    this.updatePins();
+    const result = this.apply(this.controller.flush());
+    this.lastFlushAt = clock();
     return result;
   }
+  publishSnapshot() {
+    if (this.snapshotPending) return;
+    const controller = this.controller, version = this.snapshotVersion;
+    const current = () => this.controller === controller && this.snapshotVersion === version && !this.disposed;
+    this.lastFlushAt = clock();
+    this.snapshotPending = controller.snapshot().then((result) => {
+      if (!current()) return;
+      // A queued human edit can precede its domain event.
+      for (const row of controller.ledger.rows) {
+        const object = this.golog.state.objects.get(row.id);
+        if (object) this.observe(object);
+      }
+      if (current()) {
+        const applied = this.apply(result);
+        this.owner.publish?.(applied);
+      }
+    }).catch((error) => { if (current()) this.snapshotError = error; })
+      .finally(() => { this.snapshotPending = null; });
+  }
+  step() {
+    if (this.snapshotError) throw this.snapshotError;
+    const controller = this.ensureController();
+    if (this.quiescent) return this.lastResult;
+    const result = controller.step({ resident: true, steps: 4 });
+    this.quiescent = result.diagnostics?.activeGroupCount === 0;
+    this.lastStepAt = clock();
+    if (!controller.resident) return this.apply(result);
+    // Static browser geometry reads the resident buffers directly. Canonical
+    // coordinates are synchronized only for an explicit semantic/save barrier.
+    if (this.owner.publicationMode === "local") return result;
+    if (this.quiescent) return this.flush();
+    if (clock() - this.lastFlushAt >= this.settings().commitIntervalMs) this.publishSnapshot();
+    return result;
+  }
+  setOptions() {
+    this.controller?.setOptions?.(this.settings());
+    this.inputsDirty = true; this.wake();
+  }
+  reset() { this.topologyDirty = true; this.wake(); }
+  suspend() {
+    this.flush(); this.controller?.renderAdapter?.(null);
+    this.renderSuspended = true; this.inputsDirty = true; this.quiescent = true;
+  }
+  dispose() { this.flush(); this.disposed = true; this.controller?.dispose?.(); this.releases.forEach((release) => release?.()); clearTimeout(this.pinTimer); }
+}
 
+export class LiveForceLayoutService {
+  constructor({ workspace, modeHead, createForceLayout, frameRef = globalThis, defaults = {},
+    storage = frameRef?.localStorage ?? null, origin = null, peerProvider = null, localPeerProvider = null,
+    publicationMode = "shared" } = {}) {
+    if (!["local", "shared"].includes(publicationMode)) throw new TypeError("Invalid coordinate publication mode");
+    Object.assign(this, { workspace, modeHead, createForceLayout, frameRef, storage, origin, peerProvider,
+      localPeerProvider, publicationMode, lastPartition: null, frameHandle: null, pendingPublication: false, lastClaimAttemptAt: -Infinity,
+      lastCommitSubmittedAt: -Infinity, lastPublishedPositionSnapshot: new Map() });
+    this.defaults = settingValues({ ...LIVE_FORCE_LAYOUT_DEFAULTS, ...readLiveForceLayoutDefaultSettings(storage), ...defaults });
+    this.settings = { ...this.defaults };
+    this.releases = [workspace?.bus?.on("workspace:active-changed", ({ golog }) => this.bindActiveGolog(golog)),
+      workspace?.bus?.on("mode:changed", () => {
+        if (!this.canRun()) this.layer?.suspend(); else this.layer?.wake(); this.schedule();
+      })];
+    this.bindActiveGolog(workspace?.activeGolog?.() ?? null);
+  }
+  get controller() { return this.layer?.controller ?? null; }
+  get quiescent() { return this.layer?.quiescent ?? false; }
+  get quietStepCount() { return this.quiescent ? this.settings.sleepSteps : 0; }
+  get lastResult() { return this.layer?.lastResult ?? null; }
+  snapshot() {
+    return { ...this.settings, publicationMode: this.publicationMode, active: this.canRun(), solving: this.canRun() && !this.quiescent,
+      quiescent: this.quiescent, quietStepCount: this.quietStepCount, distributedPeerCount: this.currentPeers().length,
+      localPeerId: this.localPeer()?.peerId ?? null, diagnostics: this.controller?.diagnostics?.() ?? null,
+      assignedNodeCount: this.lastPartition?.ownedIds.size ?? null };
+  }
+  emitSettingsChanged() { this.workspace?.bus?.emit(LIVE_FORCE_LAYOUT_SETTINGS_CHANGED_EVENT, this.snapshot()); }
+  setEnabled(enabled) {
+    if (!enabled) this.layer?.suspend();
+    this.settings.enabled = Boolean(enabled);
+    if (enabled) this.layer?.setOptions();
+    else if (this.frameHandle != null) { this.frameRef.cancelAnimationFrame?.(this.frameHandle); this.frameHandle = null; }
+    this.schedule(); this.emitSettingsChanged(); return this.snapshot();
+  }
+  setSettings(settings = {}) {
+    const next = settingValues({ ...this.settings, ...settings });
+    if (JSON.stringify(next) !== JSON.stringify(this.settings)) {
+      this.settings = next;
+      if (next.enabled) this.layer?.setOptions(); else this.layer?.suspend();
+      this.schedule(); this.emitSettingsChanged();
+    }
+    return this.snapshot();
+  }
+  commitSettingsAsDefaults() {
+    this.defaults = { ...this.settings };
+    return { ...writeLiveForceLayoutDefaultSettings(this.storage, this.defaults), snapshot: this.snapshot() };
+  }
+  bindActiveGolog(golog) {
+    clearTimeout(this.retryTimer); this.retryTimer = null;
+    this.layer?.dispose(); this.activeGolog = golog ?? null;
+    this.layer = golog ? new LayoutLayer(this, golog) : null;
+    this.lastPublishedPositionSnapshot = new Map(); this.pendingPublication = false;
+    this.lastCommitSubmittedAt = -Infinity; this.schedule();
+  }
+  currentPeers() { return this.publicationMode === "local" ? []
+    : (this.peerProvider?.() ?? []).filter((peer) => peer?.peerId && peer.peerId !== "peer-unknown"); }
+  localPeer() { const peer = this.publicationMode === "local" ? null : this.localPeerProvider?.(); return peer?.peerId ? peer : null; }
+  localPeerCanSolve() { return this.localPeer()?.role !== "observer"; }
+  operationOrigin() { return this.localPeer() ?? resolve(this.origin); }
+  canRun() { return Boolean(!this.disposed && this.settings.enabled && this.localPeerCanSolve() && this.activeGolog?.state.spheres.size
+    && (this.modeHead?.canRunForces?.() ?? true)); }
+  ensureController() { return this.canRun() ? this.layer.ensureController() : null; }
+  wakeSolver() { this.layer?.wake(); }
+  resetSimulation() { this.layer?.reset(); }
+  forceOptions() { return { settings: this.settings }; }
+  currentIntervalMs() { return 16; }
+  schedule() {
+    if (this.frameHandle != null || !this.canRun() || (this.quiescent && !this.layer.inputsDirty && !this.layer.topologyDirty)) return;
+    this.frameHandle = this.frameRef.requestAnimationFrame?.((time) => { this.frameHandle = null; this.tick(time); }) ?? null;
+  }
+  tick() { if (this.canRun()) this.step(); this.schedule(); }
+  step() {
+    if (!this.canRun()) return null;
+    const result = this.layer.step();
+    if (result && !result.resident) this.publish(result);
+    return result;
+  }
+  flush() { return this.layer?.flush() ?? null; }
+  publish(result) {
+    // A local snapshot is already validated and installed by LayoutLayer.apply.
+    if (!result || this.publicationMode === "local") return;
+    const controller = this.controller, store = this.activeGolog.state;
+    const owned = this.restrictToOwnedShard(result, controller);
+    const patch = changedLayoutResult(owned, this.lastPublishedPositionSnapshot, this.quiescent ? 1e-6 : 0.015);
+    this.pendingPublication = layoutResultSize(patch) > 0;
+    if (!this.pendingPublication) return;
+    const wait = this.settings.commitIntervalMs - (clock() - this.lastCommitSubmittedAt);
+    if (wait > 0) { this.retryPublication(wait); return; }
+    const operation = controller.createCommitOperation(patch, { layoutId: "live-force-layout", filterUnchanged: false });
+    const decision = store.mutationPolicy?.evaluate?.(operation, { emit: false }) ?? { ok: true };
+    if (decision.ok) {
+      controller.submitCommitOperation(operation);
+      for (const [id, value] of coordinateSnapshot(patch)) this.lastPublishedPositionSnapshot.set(id, value);
+      this.pendingPublication = false; this.lastCommitSubmittedAt = clock();
+    } else {
+      this.ensureCommitClaims(store, operation, decision);
+      if (decision.reason === "missing-resource-claim") this.retryPublication(2000);
+    }
+  }
+  retryPublication(delay) {
+    if (this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null; const result = this.flush();
+      if (result && this.canRun()) this.publish(result);
+    }, Math.max(1, delay));
+    this.retryTimer.unref?.();
+  }
   ensureCommitClaims(store, operation, decision) {
-    if (
-      !store?.resourceClaims ||
-      decision?.reason !== "missing-resource-claim"
-    ) {
-      return null;
-    }
-    const now = performance.now();
-    if (now - this.lastClaimAttemptAt < FORCE_COMMIT_CLAIM_RETRY_MS) {
-      return null;
-    }
-    // The write manifest includes the enclosing golog for conflict checks, but
-    // layout only needs the missing coordinate claims, never a golog-wide lease.
+    if (!store.resourceClaims || decision?.reason !== "missing-resource-claim" || clock() - this.lastClaimAttemptAt < 2000) return null;
     const claimant = normalizeClaimant(operation.origin);
-    const groups = decision.manifest?.requiredClaimGroups ??
-      decision.requiredClaimGroups ?? [decision.authority?.diagnostics?.missingClaimGroup ?? []];
-    const missing = [...new Set(groups
-      .filter((group) => !group.some((id) => store.resourceClaims.claimIsHeldBy(id, claimant)))
-      .map((group) => group[0])
-      .filter(Boolean))];
-    if (missing.length === 0) {
-      return null;
-    }
-    this.lastClaimAttemptAt = now;
-    return store.resourceClaims.claimResources({
-      resourceIds: missing,
-      claimant: operation.origin,
-      ttlMs: FORCE_COMMIT_CLAIM_TTL_MS,
-    });
+    const groups = decision.manifest?.requiredClaimGroups ?? decision.requiredClaimGroups
+      ?? [decision.authority?.diagnostics?.missingClaimGroup ?? []];
+    const missing = [...new Set(groups.filter((group) => !group.some((id) => store.resourceClaims.claimIsHeldBy(id, claimant)))
+      .map((group) => group[0]).filter(Boolean))];
+    if (!missing.length) return null;
+    this.lastClaimAttemptAt = clock();
+    return store.resourceClaims.claimResources({ resourceIds: missing, claimant: operation.origin, ttlMs: 30000 });
   }
-
-  restrictToOwnedShard(result, controller, options) {
-    const peers = this.activeForcePeers(this.activeGolog?.state);
-    const localPeer = this.localPeer();
-    if (peers.length < 2 || !localPeer?.peerId) {
-      this.lastPartition = null;
-      return result;
+  activeForcePeers(store) {
+    const local = this.localPeer(), key = local && peerHolderId(local), observed = new Set();
+    for (const target of store?.semanticConvergence?.snapshot?.().targets ?? []) for (const observation of target.observations ?? []) {
+      if (observation.operationType === "layout:commit" && Date.now() - observation.observedAt < 8000) observed.add(observation.observerKey);
     }
-    const graph = controller.extractGraph(options?.graphOptions ?? {});
-    const partition = partitionForceLayoutGraph(graph, peers);
-    const ownedIds = new Set(
-      Object.entries(partition.assignments)
-        .filter(([, peerId]) => peerId === localPeer.peerId)
-        .map(([id]) => id),
-    );
+    for (const claim of store?.resourceClaims?.snapshot?.() ?? []) observed.add(claim.holderId);
+    const peers = this.currentPeers().filter((peer) => peer.role !== "observer" && (peerHolderId(peer) === key || observed.has(peerHolderId(peer))));
+    if (local && local.role !== "observer" && !peers.some((peer) => peerHolderId(peer) === key)) peers.push(local);
+    return peers;
+  }
+  restrictToOwnedShard(result, controller) {
+    const peers = this.activeForcePeers(this.activeGolog?.state), local = this.localPeer();
+    if (peers.length < 2 || !local) { this.lastPartition = null; return result; }
+    const ledger = controller.extractGraph();
+    const partition = partitionForceLayoutGraph(ledger, peers);
+    const ownedIds = new Set(Object.entries(partition.assignments).filter(([, id]) => id === local.peerId).map(([id]) => id));
     this.lastPartition = { partition, ownedIds };
-    return {
-      ...result,
-      positions: (result.positions ?? []).filter((entry) => ownedIds.has(entry.id)),
-      edgeControls: (result.edgeControls ?? []).filter((entry) =>
-        ownedIds.has(entry.id),
-      ),
-    };
+    return filterLayoutResult(result, (entry) => ownedIds.has(entry.id));
   }
-
   dispose() {
-    this.releaseStateListener?.();
-    this.releaseConvergenceListener?.();
-    this.releaseGlueListener?.();
-    this.releaseClaimsListener?.();
-    this.releaseWorkspaceListener?.();
-    this.releaseModeListener?.();
-    if (this.frameHandle) {
-      this.frameRef.cancelAnimationFrame?.(this.frameHandle);
-      this.frameHandle = null;
-    }
+    this.disposed = true; this.layer?.dispose(); this.releases.forEach((release) => release?.()); clearTimeout(this.retryTimer);
+    this.frameRef.cancelAnimationFrame?.(this.frameHandle); this.frameHandle = null;
   }
 }
-
-export function createLiveForceLayoutService(options = {}) {
-  return new LiveForceLayoutService(options);
-}
+export function createLiveForceLayoutService(options = {}) { return new LiveForceLayoutService(options); }
 
 export class PreviewForceUniverse {
-  constructor({
-    createForceLayout,
-    settingsProvider = null,
-    settingsBus = null,
-    externalIntentProvider = null,
-    frameRef = globalThis,
-    origin = null,
-  } = {}) {
-    this.createForceLayout = createForceLayout;
-    this.settingsProvider = settingsProvider;
-    this.settingsBus = settingsBus;
-    this.externalIntentProvider = externalIntentProvider;
-    this.frameRef = frameRef;
-    this.origin = origin;
-    this.entries = new Map();
-    this.frameHandle = null;
-    this.disposed = false;
-    this.lastSettingsSignature = "";
-    this.releaseSettingsListener = this.settingsBus?.on?.(
-      LIVE_FORCE_LAYOUT_SETTINGS_CHANGED_EVENT,
-      () => {
-        this.wakeAll();
-        this.schedule();
-      },
-    );
-  }
-
-  settings() {
-    return {
-      ...LIVE_FORCE_LAYOUT_DEFAULTS,
-      ...(typeof this.settingsProvider === "function"
-        ? this.settingsProvider() ?? {}
-        : {}),
-    };
-  }
-
-  settingsSignature() {
-    return JSON.stringify(this.settings());
-  }
-
-  setVisibleGologs(gologs = []) {
-    if (this.disposed) {
-      return;
-    }
-    const visible = new Map(
-      gologs.filter(Boolean).map((golog) => [golog.id, golog]),
-    );
-    for (const [gologId, entry] of this.entries.entries()) {
-      if (visible.get(gologId) === entry.golog) {
-        continue;
-      }
-      entry.releaseStateListener?.();
-      this.entries.delete(gologId);
-    }
-    for (const [gologId, golog] of visible.entries()) {
-      if (this.entries.has(gologId)) {
-        continue;
-      }
-      const entry = {
-        golog,
-        controller: null,
-        topologySignature: null,
-        quiescent: false,
-        quietStepCount: 0,
-        lastStepAt: -Infinity,
-        applyingPreview: false,
-        releaseStateListener: null,
-      };
-      entry.releaseStateListener = golog.bus.on("state:changed", () => {
-        if (!entry.applyingPreview) {
-          entry.quiescent = false;
-          entry.quietStepCount = 0;
-        }
-        this.schedule();
-      });
-      this.entries.set(gologId, entry);
-    }
-    this.schedule();
-  }
-
-  wakeAll() {
-    for (const entry of this.entries.values()) {
-      entry.quiescent = false;
-      entry.quietStepCount = 0;
-    }
-  }
-
-  hasActiveEntry() {
-    return [...this.entries.values()].some(
-      (entry) => !entry.quiescent && entry.golog.state.spheres.size > 0,
-    );
-  }
-
-  schedule() {
-    if (
-      this.disposed ||
-      this.frameHandle ||
-      this.entries.size === 0 ||
-      !this.hasActiveEntry() ||
-      this.settings().enabled === false ||
-      !this.frameRef?.requestAnimationFrame
-    ) {
-      return;
-    }
-    this.frameHandle = this.frameRef.requestAnimationFrame((time) =>
-      this.tick(time),
-    );
-  }
-
-  tick(time = performance.now()) {
-    this.frameHandle = null;
-    if (this.disposed) {
-      return;
-    }
-    this.stepAll(time);
-    this.schedule();
-  }
-
-  stepAll(time = null) {
-    const signature = this.settingsSignature();
-    if (signature !== this.lastSettingsSignature) {
-      for (const entry of this.entries.values()) {
-        entry.controller = null;
-        entry.topologySignature = null;
-        entry.quiescent = false;
-        entry.quietStepCount = 0;
-      }
-      this.lastSettingsSignature = signature;
-    }
-    if (this.settings().enabled === false) {
-      return [];
-    }
-    return [...this.entries.values()]
-      .map((entry) => {
-        if (time !== null && time - entry.lastStepAt < stepIntervalMs(entry.golog.state, this.settings())) return null;
-        const result = this.stepEntry(entry);
-        if (result && time !== null) entry.lastStepAt = time;
-        return result;
-      })
-      .filter(Boolean);
-  }
-
-  stepEntry(entry) {
-    if (entry.quiescent || entry.golog.state.spheres.size === 0) {
-      return null;
-    }
-    const store = entry.golog.state;
-    const options = this.forceOptions(store);
-    const signature = topologySignature(store);
-    if (!entry.controller) {
-      entry.controller = this.createForceLayout(entry.golog, {
-        ...(this.origin ? { origin: resolveOrigin(this.origin) } : {}),
-      });
-    }
-    if (entry.topologySignature !== signature) {
-      entry.controller.reset(options);
-      entry.topologySignature = signature;
-    }
-
-    const preStepPositions = positionSnapshot(store);
-    const humanControlledIds = humanControlledSphereIds(store);
-    const externalIntents =
-      typeof this.externalIntentProvider === "function"
-        ? this.externalIntentProvider({
-            golog: entry.golog,
-            store,
-            entry,
-            universe: this,
-          })
-        : [];
-    const result = entry.controller.step({
-      positionEvents: positionEventsForStore(store, humanControlledIds),
-      externalIntents: [
-        sharedConvergenceIntents(store, this.settings().globalCoherence),
-        externalIntents,
-      ],
+  constructor({ createForceLayout, settingsProvider = null, settingsBus = null, externalIntentProvider = null,
+    frameRef = globalThis, origin = null, canRun = null, publicationMode = "shared" } = {}) {
+    Object.assign(this, { createForceLayout, settingsProvider, settingsBus, externalIntentProvider, frameRef, origin,
+      publicationMode, runAllowed: canRun, entries: new Map(), frameHandle: null, disposed: false });
+    this.releaseSettings = settingsBus?.on(LIVE_FORCE_LAYOUT_SETTINGS_CHANGED_EVENT, () => {
+      for (const entry of this.entries.values()) { if (this.canRun()) entry.setOptions(); else entry.suspend(); } this.schedule();
     });
-    const previewResult = withoutHumanClaimedPositions(result, humanControlledIds);
-    const movedBeyondRestTolerance = resultMovedSnapshot(
-      previewResult,
-      preStepPositions,
-      FORCE_QUIESCENCE_MOVEMENT_SQ,
-    );
-    const maxForceMagnitude = maxForceMagnitudeSq(result);
-    if (resultMovedSnapshot(previewResult, preStepPositions)) {
-      entry.applyingPreview = true;
-      store.applyLayoutPreviewPositions?.(
-        previewResult.positions,
-        previewResult.edgeControls,
-      );
-      queueMicrotask(() => {
-        entry.applyingPreview = false;
-      });
-    }
-    if (maxForceMagnitude <= FORCE_QUIESCENCE_FORCE_SQ && !movedBeyondRestTolerance) {
-      entry.quietStepCount += 1;
-    } else {
-      entry.quietStepCount = 0;
-    }
-    if (entry.quietStepCount >= FORCE_QUIESCENCE_TICKS) {
-      entry.quiescent = true;
-    }
-    return result;
   }
-
-  forceOptions(store) {
-    return forceOptionsFor(store, this.settings());
+  settings() { return settingValues({ ...LIVE_FORCE_LAYOUT_DEFAULTS, ...(this.settingsProvider?.() ?? {}) }); }
+  canRun() { return !this.disposed && this.settings().enabled && resolve(this.origin)?.role !== "observer"
+    && (this.runAllowed?.() ?? true); }
+  setVisibleGologs(gologs = []) {
+    if (this.disposed) return;
+    const visible = new Map(gologs.filter(Boolean).map((golog) => [golog.id, golog]));
+    for (const [id, entry] of this.entries) if (visible.get(id) !== entry.golog) { entry.dispose(); this.entries.delete(id); }
+    for (const [id, golog] of visible) if (!this.entries.has(id)) this.entries.set(id, new LayoutLayer(this, golog));
+    this.schedule();
   }
-
+  hasActiveEntry() { return [...this.entries.values()].some((entry) => entry.golog.state.spheres.size > 0
+    && (!entry.quiescent || entry.inputsDirty || entry.topologyDirty)); }
+  wakeAll() { for (const entry of this.entries.values()) entry.wake(); }
+  schedule() {
+    if (!this.canRun() || this.frameHandle != null || !this.hasActiveEntry()) return;
+    this.frameHandle = this.frameRef.requestAnimationFrame?.((time) => { this.frameHandle = null; this.tick(time); }) ?? null;
+  }
+  tick(time) { this.stepAll(time); this.schedule(); }
+  stepAll() {
+    if (!this.canRun()) return [];
+    return [...this.entries.values()].map((entry) => this.stepEntry(entry)).filter(Boolean);
+  }
+  stepEntry(entry) { return entry.golog.state.spheres.size ? entry.step() : null; }
+  forceOptions() { return { settings: this.settings() }; }
+  flush() { return [...this.entries.values()].map((entry) => entry.flush()).filter(Boolean); }
   dispose() {
-    this.disposed = true;
-    this.releaseSettingsListener?.();
-    for (const entry of this.entries.values()) {
-      entry.releaseStateListener?.();
-    }
-    this.entries.clear();
-    if (this.frameHandle) {
-      this.frameRef.cancelAnimationFrame?.(this.frameHandle);
-      this.frameHandle = null;
-    }
+    this.disposed = true; this.releaseSettings?.(); this.entries.forEach((entry) => entry.dispose()); this.entries.clear();
+    this.frameRef.cancelAnimationFrame?.(this.frameHandle); this.frameHandle = null;
   }
 }

@@ -35,7 +35,7 @@ export function syncThetaVolumeObject(store, volume) {
   for (const position of positions) origin.add(position);
   if (positions.length) origin.multiplyScalar(1 / positions.length);
   store.upsertObject({ ...volume, kind: "volume", dimension: 3, lockable: true,
-    origin, label: createObjectLabel(volume.name, origin, { size: 0.5 }),
+    origin, label: createObjectLabel(volume.name || "Region", origin, { size: 0.5 }),
     render: { color: 0x9ba9ff, opacity: 0.2, ...(volume.render ?? {}) } });
 }
 

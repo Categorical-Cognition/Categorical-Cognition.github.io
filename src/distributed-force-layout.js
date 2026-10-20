@@ -95,9 +95,7 @@ function balancedAssignments(vertices, peers) {
 
 export function partitionForceLayoutGraph(graph, peers = []) {
   const normalizedPeers = normalizePeers(peers);
-  const partitionVertices = (graph.vertices ?? []).filter(
-    (vertex) => vertex.layoutKind !== "edge-control",
-  );
+  const units = graph.groups.map((members) => ({ id: graph.rows[members[0]].id, members }));
   if (normalizedPeers.length === 0) {
     return {
       format: FORCE_LAYOUT_SHARD_FORMAT,
@@ -108,15 +106,12 @@ export function partitionForceLayoutGraph(graph, peers = []) {
     };
   }
 
-  const assignments = balancedAssignments(partitionVertices, normalizedPeers);
-  // Controls in the same unordered endpoint plane share its first node's owner.
-  // The partition proposes work; exact resource claims still authorize commits.
-  for (const control of graph.edgeControls ?? (graph.vertices ?? []).filter(
-    (vertex) => vertex.layoutKind === "edge-control",
-  )) {
-    const endpointId = [control.sourceId, control.targetId].sort()[0];
-    assignments[control.id] = assignments[endpointId] ?? assignPeer(control.id, normalizedPeers);
-  }
+  // A coupled coordinate group has one proposed solver; resource claims still
+  // authorize each coordinate independently, without a workspace-wide lease.
+  const owners = balancedAssignments(units, normalizedPeers);
+  const assignments = Object.fromEntries(units.flatMap((unit) => unit.members
+    .map((index) => graph.rows[index]).filter((row) => row.dof)
+    .map((row) => [row.id, owners[unit.id]])));
   return {
     format: FORCE_LAYOUT_SHARD_FORMAT,
     version: FORCE_LAYOUT_SHARD_VERSION,

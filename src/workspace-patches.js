@@ -281,18 +281,17 @@ export class WorkspacePatchHistory {
     return committed;
   }
 
-  beginInteraction(store, objectId) {
+  beginInteraction(store, objectId, snapshot = store.capturePatchSnapshot?.(objectId)) {
     if (this.isApplying) {
       return;
     }
-    const snapshot = store.capturePatchSnapshot?.(objectId);
-    if (!snapshot) {
+    if (!snapshot || snapshot.objectId !== objectId) {
       return;
     }
     this.dragDrafts.set(this.draftKey(store.gologId, snapshot.objectId), {
       gologId: store.gologId,
       objectId: snapshot.objectId,
-      snapshot,
+      snapshot: clonePatchValue(snapshot),
     });
   }
 
@@ -305,14 +304,22 @@ export class WorkspacePatchHistory {
       if (draft.gologId !== store.gologId || !released.has(draft.objectId)) {
         continue;
       }
-      this.dragDrafts.delete(key);
-      const changes = store.diffPatchSnapshot?.(draft.snapshot) ?? [];
-      this.recordChanges({
-        gologId: store.gologId,
-        label: `Move ${draft.objectId}`,
-        changes,
-      });
+      this.endInteraction(store, draft.objectId);
     }
+  }
+
+  endInteraction(store, objectId, current = store.capturePatchSnapshot?.(objectId)) {
+    const key = this.draftKey(store.gologId, objectId), draft = this.dragDrafts.get(key);
+    if (!draft || this.isApplying) return;
+    this.dragDrafts.delete(key);
+    if (!current || current.objectId !== objectId || current.collection !== draft.snapshot.collection) return;
+    const changes = Object.entries(draft.snapshot.properties).flatMap(([property, before]) => {
+      const after = current.properties[property];
+      return patchValuesEqual(before, after) ? [] : [{
+        collection: current.collection, objectId, property, before, after,
+      }];
+    });
+    return this.recordChanges({ gologId: store.gologId, label: `Move ${objectId}`, changes });
   }
 
   undo() {

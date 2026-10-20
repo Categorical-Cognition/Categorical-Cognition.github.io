@@ -219,6 +219,7 @@ export function bindStatusPanel({
   navigateBackGolog,
   navigateForwardGolog,
   saveWorkspaceDocument,
+  flushLayout,
   loadWorkspaceDocumentText,
   devReloadWithRestore,
   liveForceLayout,
@@ -271,6 +272,11 @@ export function bindStatusPanel({
   volumeStatus.id = "theta-volume-status";
   volumeStatus.hidden = true;
   selectedObjectTitle?.parentElement?.append(volumeStatus);
+  const boundarySelectionStatus = documentRef.createElement("p");
+  boundarySelectionStatus.id = "boundary-selection-status";
+  boundarySelectionStatus.setAttribute("role", "status");
+  boundarySelectionStatus.hidden = true;
+  selectedObjectTitle?.parentElement?.append(boundarySelectionStatus);
   const selectedNodePosition = documentRef.querySelector(
     "#selected-node-position",
   );
@@ -617,6 +623,7 @@ export function bindStatusPanel({
 
   function bindPayloadPreview(gologId) {
     const renderer = ensurePayloadPreviewRenderer();
+    if (renderer.golog?.id !== gologId) flushLayout?.(gologId);
     renderer.setGolog(workspace.gologs.get(gologId) ?? null);
     requestAnimationFrame(() => renderer.render());
   }
@@ -909,7 +916,7 @@ export function bindStatusPanel({
     }
 
     const object = state.getObject(editedLabelId);
-    const anchor = labelAnchorForObject(object);
+    const anchor = scene.residentAnchor?.(editedLabelId) ?? labelAnchorForObject(object);
     if (!anchor) {
       if (sceneLabelEditorFallbackPoint) {
         const point = clampSceneLabelPoint(sceneLabelEditorFallbackPoint);
@@ -1589,7 +1596,7 @@ export function bindStatusPanel({
       "disconnected-boundary": "The boundary has disconnected pieces.",
     };
     volumeStatus.textContent = status && !status.ok
-      ? `Region hidden: ${reasons[status.reason] ?? "The boundary cannot enclose a valid region."}` : "";
+      ? `Solid hidden: ${reasons[status.reason] ?? "The boundary cannot enclose a valid region."}` : "";
   }
 
   function applyModeSnapshot(snapshot = modeHead.snapshot()) {
@@ -1653,6 +1660,7 @@ export function bindStatusPanel({
   }
 
   function clearActiveListeners() {
+    if (scene?.updateDomOverlays === positionSceneLabelEditor) scene.updateDomOverlays = null;
     for (const release of releaseActiveListeners) {
       release();
     }
@@ -2020,8 +2028,11 @@ export function bindStatusPanel({
     bus = golog.bus;
     state = golog.state;
     scene = nextScene;
+    scene.updateDomOverlays = positionSceneLabelEditor;
     allPayloadMediaExpanded = false;
     selectedSimplexId = null;
+    boundarySelectionStatus.hidden = true;
+    boundarySelectionStatus.textContent = "";
     labelsVisible = scene.labelsVisible;
     updateLabelToggle();
 
@@ -2034,6 +2045,10 @@ export function bindStatusPanel({
       ),
       bus.on("render:volume-selected", () => applyStateSnapshot(state.snapshot())),
       bus.on("render:volume-status", () => updateVolumeStatus()),
+      bus.on("creation:boundary-status", ({ text }) => {
+        boundarySelectionStatus.textContent = text;
+        boundarySelectionStatus.hidden = !text;
+      }),
       bus.on("camera:frame-changed", () => positionSceneLabelEditor()),
       bus.on("label:edit-requested", ({ id }) => openSceneLabelEditor(id)),
       bus.on("payload:scene-pick", (selectable) =>
@@ -2986,7 +3001,10 @@ export function bindStatusPanel({
   workspace.bus.on("workspace:history-changed", (summary) =>
     updateHistoryControls(summary),
   );
-  workspace.bus.on("mode:changed", (snapshot) => applyModeSnapshot(snapshot));
+  workspace.bus.on("mode:changed", (snapshot) => {
+    if (scene?.selectionBuffer?.[0]?.kind === "surface") scene.rememberSelection(null);
+    applyModeSnapshot(snapshot);
+  });
   documentRef.defaultView?.addEventListener("resize", scheduleRightUiStackUpdate);
 
   applyPanelCollapseState();
